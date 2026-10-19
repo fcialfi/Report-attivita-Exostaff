@@ -1135,6 +1135,23 @@ def load_week_entries(year: int, cw: int) -> list:
         return []
 
 
+def archive_is_up_to_date(data: list, loaded_keys: set) -> bool:
+    """True if "Save week" would not change any weekly archive file."""
+    groups: dict[tuple, list] = {}
+    for a in normalise_data(data):
+        try:
+            groups.setdefault(iso_year_week_for_date(safe_date(a["date"])), []).append(a)
+        except ValueError:
+            pass
+    weeks = set(groups) | {w for w in map(_week_of_key, loaded_keys) if w}
+    for y, cw in weeks:
+        existing = load_week_entries(y, cw)
+        merged = merge_week(existing, groups.get((y, cw), []), loaded_keys)
+        if sorted(map(activity_key, merged)) != sorted(map(activity_key, existing)):
+            return False
+    return True
+
+
 def save_weekly_archive(data: list, ref_date: date | None = None,
                         loaded_keys: set | frozenset = frozenset()) -> Path | None:
     if ref_date is None:
@@ -3076,6 +3093,7 @@ class App:
                 # whose deletion still has to reach the archive)
                 self._loaded_week_keys = (load_table_state()
                                           | {_stable_key_fn(a) for a in self.data})
+                self._table_dirty_after_load()
                 # Set working week
                 if self.data:
                     try:
@@ -3109,6 +3127,8 @@ class App:
         splash.set_status("Building interface…")
         self._build_menu()
         self.build_ui()
+        if self._table_dirty:
+            self._set_table_dirty()   # highlight Save week now that it exists
         self.refresh()
         self._bind_shortcuts()
 
@@ -3320,6 +3340,20 @@ class App:
         win_x = wa_x + (wa_w - win_w) // 2
         win_y = wa_y + max(0, (wa_h - win_h) // 2)
         root.geometry(f"{win_w}x{win_h}+{win_x}+{win_y}")
+
+    def _table_dirty_after_load(self) -> None:
+        """A table restored from the previous session may hold changes that
+        never reached the archive: treat it as unsaved, so that loading
+        another week asks first instead of discarding them."""
+        try:
+            up_to_date = archive_is_up_to_date(self.data, self._loaded_week_keys)
+        except Exception as exc:
+            log.warning("archive check failed: %s", exc)
+            up_to_date = False
+        if up_to_date:
+            self._clear_table_dirty()
+        else:
+            self._set_table_dirty()
 
     def _set_table_dirty(self) -> None:
         """Mark table as having unsaved changes — highlight Save week button."""
@@ -4364,12 +4398,14 @@ class App:
                     all_current = normalise_data(
                         json.loads(f.read_text(encoding="utf-8"))
                     )
-                    from_current = [
-                        a for a in all_current
-                        if iso_year_week_for_date(safe_date(a["date"])) == current_yw
-                    ]
-                except Exception:
-                    pass
+                    for a in all_current:
+                        try:   # one unreadable date must not drop the whole week
+                            if iso_year_week_for_date(safe_date(a["date"])) == current_yw:
+                                from_current.append(a)
+                        except ValueError:
+                            pass
+                except Exception as exc:
+                    log.warning("load_current_week: %s", exc)
 
             # Merge: in-progress entries replace their archived versions
             merged = normalise_data(merge_entries(from_archive, from_current))
@@ -4505,6 +4541,7 @@ class App:
         if data_load_warning:
             messagebox.showwarning("Data file problem", data_load_warning)
         self._loaded_week_keys = load_table_state() | {_stable_key_fn(a) for a in self.data}
+        self._table_dirty_after_load()
         if self.data:
             try:
                 ref = max(safe_date(a["date"]) for a in self.data if a.get("date"))
@@ -5097,13 +5134,14 @@ Fill in the form at the top of the window:
   • Type        — Activity / Holiday / Sick Leave
   • Effort (PD) — person-days worked (e.g. 0.5 or 1.0)
                   Warning shown if daily total exceeds 1.0 PD.
-  • Task        — select from the list extracted from the template
+  • Task        — select from the list in config/tasks.txt
   • Description — brief description of what was done
 
 Click "💾 Save entry" (Ctrl+S) to add the entry to the table.
 
 To edit: double-click a row, make changes, Save again.
-To duplicate: right-click → Duplicate (useful for recurring tasks).
+To duplicate: right-click → Duplicate. The entry is copied into the
+form as a NEW entry; adjust it and click Save entry to add it.
 To delete: select a row and press Delete.
 To undo: press Ctrl+Z (up to 20 levels).
 
@@ -5197,10 +5235,11 @@ If not set, all data is stored in the tool's local folder.
 ──────────────────────────────────────────────────────────────
 When running from a shared folder, only one user can have the
 tool open at a time. If another user has it open, you will see
-a warning with their name, timestamp and process ID.
+a warning with their name, PC and when they were last seen.
 
-Stale locks (left after a crash) are detected automatically
-via process ID and cleared without any user action needed.
+A running tool refreshes its lock every 5 minutes. A lock that
+has not been refreshed for 15 minutes (left after a crash) is
+cleared automatically.
 
 Use "🔓 Force Unlock" only if you are certain the other user
 is no longer running the tool.
@@ -5209,6 +5248,9 @@ is no longer running the tool.
 9. DATA FILES & BACKUPS
 ──────────────────────────────────────────────────────────────
   activities_current.json   — current unsaved week entries
+  activities_current.state.json — entries loaded in the table (so
+                              deletions reach the archive even
+                              without Save week)
   app_state.json            — UI preferences (user, folders)
   next_week_plan.json       — planned activities for next week
   activity_report.lock      — multi-user lock (auto-managed)
@@ -5222,9 +5264,9 @@ or in the tool's local folder. View the log via Help → View log.
 ──────────────────────────────────────────────────────────────
 10. RESET
 ──────────────────────────────────────────────────────────────
-File → Reset permanently deletes all entries in the current
-table. Use it only to start fresh. Weekly archives already
-saved are NOT affected.
+File → Reset clears the current table. Use it only to start
+fresh. Entries already saved in the weekly archives are NOT
+deleted and still count in the monthly report.
 
 ──────────────────────────────────────────────────────────────
 11. VERSION & AUTO-UPDATE
@@ -5232,9 +5274,9 @@ saved are NOT affected.
 The current version is shown in the top-right corner of the
 header bar (e.g. "v1.1.0").
 
-The tool checks for updates automatically at startup, once
-the Working folder is set. It compares its own version with
-VERSION.txt on the shared folder.
+The tool checks for updates at startup and every 4 hours while
+open. It compares its own version with VERSION.txt in the
+release folder (the shared OneDrive folder).
 
 If a newer version is available:
   • A popup appears: "New version available vX.X.X"
