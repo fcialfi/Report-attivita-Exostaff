@@ -4298,7 +4298,7 @@ class App:
             self._clear_table_dirty()
             self._persist()
             self.refresh()
-            self.desc.delete("1.0", "end")
+            self.cancel_edit(clear_desc=True)   # resets the form and its baseline
             self._status("Table cleared.")
         except Exception as e:
             log.error("reset_data: %s", e)
