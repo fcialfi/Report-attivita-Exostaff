@@ -56,7 +56,7 @@ for /f "delims=" %%v in ('python update_version.py') do set CURRENT_VERSION=%%v
 echo  Current version: %CURRENT_VERSION%
 set /p NEW_VERSION=New version (blank = keep %CURRENT_VERSION%): 
 if "%NEW_VERSION%"=="" set NEW_VERSION=%CURRENT_VERSION%
-python update_version.py %NEW_VERSION%
+python update_version.py %NEW_VERSION% "%EXE_SHARE%"
 if errorlevel 1 ( echo [ERROR] Version update failed. & pause & exit /b 1 )
 echo  [OK] Version: %NEW_VERSION%
 
@@ -75,7 +75,7 @@ if exist %APP_NAME%.spec del %APP_NAME%.spec
 :: ── Build ───────────────────────────────────────────────────────────────
 echo.
 echo  [INFO] Building exe...
-python -m PyInstaller --onefile --windowed --name "%APP_NAME%" --distpath "%DIST_DIR%" --workpath "%BUILD_DIR%" --clean %SCRIPT% >> %LOG_FILE% 2>&1
+python -m PyInstaller --onefile --windowed --name "%APP_NAME%" --icon "assets\exostaff_icon.ico" --add-data "assets;assets" --distpath "%DIST_DIR%" --workpath "%BUILD_DIR%" --clean %SCRIPT% >> %LOG_FILE% 2>&1
 if errorlevel 1 ( echo [ERROR] Build FAILED. See %LOG_FILE%. & pause & exit /b 1 )
 echo  [OK] Build successful.
 
@@ -86,20 +86,32 @@ echo %NEW_VERSION%> "%DIST_DIR%\VERSION.txt"
 echo  [INFO] Deploying...
 if not exist "%EXE_SHARE%" mkdir "%EXE_SHARE%"
 
-copy /y "%DIST_DIR%\%APP_NAME%.exe" "%EXE_SHARE%\%APP_NAME%.exe" >nul
+:: Versioned copy: EXE_LOCATION points to it, so a PC where OneDrive has
+:: synced VERSION.txt but not yet the new exe cannot "update" to the old one.
+del /q "%EXE_SHARE%\%APP_NAME%_*.exe" 2>nul
+copy /y "%DIST_DIR%\%APP_NAME%.exe" "%EXE_SHARE%\%APP_NAME%_%NEW_VERSION%.exe" >nul
 if errorlevel 1 ( echo [ERROR] Copy exe failed. Check network. & pause & exit /b 1 )
+:: Plain name for new users downloading by hand
+copy /y "%DIST_DIR%\%APP_NAME%.exe" "%EXE_SHARE%\%APP_NAME%.exe" >nul
+if errorlevel 1 ( echo [WARN] %APP_NAME%.exe is in use - only the versioned copy was updated. )
 echo  [OK] Exe deployed.
 
 copy /y "%DIST_DIR%\VERSION.txt" "%DATA_SHARE%\VERSION.txt" >nul
+if errorlevel 1 ( echo [ERROR] VERSION.txt copy failed - users will NOT be notified. & pause & exit /b 1 )
 echo  [OK] VERSION.txt updated.
 
-echo %EXE_SHARE%\%APP_NAME%.exe> "%DATA_SHARE%\EXE_LOCATION.txt"
+echo %EXE_SHARE%\%APP_NAME%_%NEW_VERSION%.exe> "%DATA_SHARE%\EXE_LOCATION.txt"
 echo  [OK] EXE_LOCATION.txt updated.
 
 set TEMPLATE=EPS-Sterna and EPS-Aeolus System Engineering Service Template.docx
-if exist "%TEMPLATE%" (
-    copy /y "%TEMPLATE%" "%EXE_SHARE%\%TEMPLATE%" >nul
+set TEMPLATE_SRC=
+if exist "%TEMPLATE%" set "TEMPLATE_SRC=%TEMPLATE%"
+if exist "config\%TEMPLATE%" set "TEMPLATE_SRC=config\%TEMPLATE%"
+if defined TEMPLATE_SRC (
+    copy /y "%TEMPLATE_SRC%" "%EXE_SHARE%\%TEMPLATE%" >nul
     echo  [OK] Template copied.
+) else (
+    echo  [WARN] Template not found - not copied.
 )
 
 echo.

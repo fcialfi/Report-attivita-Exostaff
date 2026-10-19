@@ -1,2 +1,2 @@
-EXE_SHARE=N:\temp\Fabio\Exostaff Report Generator
-DATA_SHARE=N:\temp\Fabio\Exostaff Report Generator
+EXE_SHARE=C:\Users\Cialfi\OneDrive - eumetsat.int\Exostaff Report Generator
+DATA_SHARE=C:\Users\Cialfi\OneDrive - eumetsat.int\Exostaff Report Generator
