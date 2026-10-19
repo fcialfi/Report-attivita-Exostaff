@@ -1563,20 +1563,32 @@ def _weekly_items_for_period(data: list, start: date, end: date) -> dict[str, li
 # Next-week plan persistence
 # ---------------------------------------------------------------------------
 
-def load_next_week_plan() -> dict[str, list[str]]:
-    """Returns {project: [bullet, ...]} or empty dict."""
+def week_after(year: int, cw: int) -> tuple[int, int]:
+    return iso_year_week_for_date(iso_week_monday(year, cw) + timedelta(days=7))
+
+
+def load_next_week_plan(target: tuple[int, int] | None = None) -> dict[str, list[str]]:
+    """Returns {group: [bullet, ...]} or empty dict.
+    The file records the week it plans for; with `target`, a plan written
+    for another week is ignored so an old plan never reappears as "Next week".
+    Files from older versions have no week and are returned as they are."""
     if not next_week_file().exists():
         return {}
     try:
-        return json.loads(next_week_file().read_text(encoding="utf-8"))
+        raw = json.loads(next_week_file().read_text(encoding="utf-8"))
     except Exception as exc:
         log.warning("load_next_week_plan failed: %s", exc)
         return {}
+    if isinstance(raw, dict) and "plan" in raw and "target_week" in raw:
+        if target is not None and tuple(raw["target_week"]) != tuple(target):
+            return {}
+        return raw["plan"]
+    return raw
 
 
-def save_next_week_plan(plan: dict[str, list[str]]) -> None:
+def save_next_week_plan(plan: dict[str, list[str]], target: tuple[int, int]) -> None:
     try:
-        atomic_write_json(next_week_file(), plan)
+        atomic_write_json(next_week_file(), {"target_week": list(target), "plan": plan})
     except Exception as exc:
         log.warning("save_next_week_plan failed: %s", exc)
 
@@ -2254,13 +2266,14 @@ class _FittedToplevel(tk.Toplevel):
 class NextWeekEditor(_FittedToplevel):
     DEFAULT_GROUPS = ["EPS-Sterna", "EPS-Aeolus", "Common"]
 
-    def __init__(self, parent, tasks: list[tuple]):
+    def __init__(self, parent, tasks: list[tuple], target: tuple[int, int]):
         super().__init__(parent)
         self.title("Next Week — Planned Activities")
         self.resizable(True, True)
         self._fit_window(780, 560)
-        self.tasks  = tasks
-        self._plan  = load_next_week_plan()
+        self.tasks   = tasks
+        self._target = target   # (year, CW) being planned
+        self._plan   = load_next_week_plan(target)
         # Same grouping as the weekly summary: by WP when tasks.txt has WPs
         wps = sorted({wp for _, _, wp in tasks if wp},
                      key=lambda w: (0 if w.upper().startswith("WP") else 1, w))
@@ -2277,9 +2290,9 @@ class NextWeekEditor(_FittedToplevel):
             font=("Segoe UI", 11, "bold"), fg=FG_MAIN, bg=BG_ROOT,
         ).pack(pady=(14, 2))
 
-        next_mon = iso_week_monday(*iso_year_week_for_date(date.today())) + timedelta(days=7)
+        y, cw    = self._target
+        next_mon = iso_week_monday(y, cw)
         next_fri = next_mon + timedelta(days=4)
-        y, cw    = iso_year_week_for_date(next_mon)
         tk.Label(
             self,
             text=f"CW{cw:02d} / {y}  —  {next_mon.strftime('%d %b')} → {next_fri.strftime('%d %b %Y')}",
@@ -2361,8 +2374,9 @@ class NextWeekEditor(_FittedToplevel):
 
     def _save(self):
         plan = self._collect()
-        save_next_week_plan(plan)
-        messagebox.showinfo("Saved", "Next-week plan saved.", parent=self)
+        save_next_week_plan(plan, self._target)
+        messagebox.showinfo("Saved", f"Plan for CW{self._target[1]:02d}/{self._target[0]} saved.",
+                            parent=self)
 
     def _clear(self):
         if messagebox.askyesno("Clear", "Clear all planned activities?", parent=self):
@@ -2805,7 +2819,6 @@ class App:
         self.data:             list       = []
         self.edit_index:       int | None = None
         self._undo_stack:      list       = []
-        self._save_dirty:      bool       = False
         self._save_count:      int        = 0
         self._loaded_week_keys: set       = set()
         self._table_dirty:     bool       = False
@@ -2996,7 +3009,10 @@ class App:
 
     def _bind_shortcuts(self):
         self.root.bind("<Control-s>", lambda e: self.save_activity())
-        self.root.bind("<Control-z>", lambda e: self.undo())
+        # Not while typing in a field: users expect Ctrl+Z to undo text there,
+        # not to silently revert the last table change on the share
+        self.root.bind("<Control-z>", lambda e: None if isinstance(e.widget, (tk.Entry, tk.Text))
+                       else self.undo())
         self.root.bind("<F5>",        lambda e: self.refresh())
         self.tree.bind("<Delete>",    lambda e: self.delete_selected())
 
@@ -3005,7 +3021,7 @@ class App:
     # -----------------------------------------------------------------------
 
     def on_close(self) -> None:
-        if self._save_dirty:
+        if self._form_dirty():
             if not messagebox.askyesno(
                 "Unsaved changes",
                 "You have unsaved changes in the form.\nExit anyway?",
@@ -3129,31 +3145,27 @@ class App:
         self._status_var.set(msg)
         self.root.after(6000, lambda: self._status_var.set(""))
 
-    def _mark_entry_mode(self, *_) -> None:
-        """Called when user types in the form — if edit_index is set,
-        the Save button will UPDATE that entry. Use New entry to add instead."""
-        self._save_dirty = True
-
-    def _new_entry(self) -> None:
-        """Explicitly reset to new-entry mode — clears form and edit_index."""
-        self.edit_index = None
-        self._mark_clean()
-        self.desc.delete("1.0", "end")
-        if self._working_week:
-            today_yw = iso_year_week_for_date(date.today())
-            if self._working_week == today_yw:
-                self.date_var.set(date.today().strftime("%d/%m/%y"))
-            else:
-                self.date_var.set(iso_week_monday(*self._working_week).strftime("%d/%m/%y"))
-        else:
-            self.date_var.set(date.today().strftime("%d/%m/%y"))
-        self._status("New entry mode — form cleared.")
-
-    def _mark_dirty(self, *_) -> None:
-        self._save_dirty = True
+    def _form_snapshot(self) -> tuple | None:
+        if not hasattr(self, "desc"):
+            return None
+        return (self.date_var.get(), self.user_var.get(), self.entry_type_var.get(),
+                self.effort_var.get(), self.wp_var.get(), self.task_var.get(),
+                self.desc.get("1.0", "end").strip())
 
     def _mark_clean(self) -> None:
-        self._save_dirty = False
+        """Remember the form as it is now; it is 'dirty' once it differs."""
+        self._clean_form = self._form_snapshot()
+
+    def _form_dirty(self) -> bool:
+        """Editing an entry: any changed field counts. New entry: only typed
+        description text counts (picking user/date/task alone is not work to lose)."""
+        snap = getattr(self, "_clean_form", None)
+        now  = self._form_snapshot()
+        if snap is None or now is None:
+            return False
+        if self.edit_index is None:
+            return now[-1] != snap[-1]
+        return now != snap
 
     # -----------------------------------------------------------------------
     # UI construction
@@ -3317,12 +3329,6 @@ class App:
         self.desc = tk.Text(desc_row, height=4, font=("Segoe UI", 9), wrap="word",
                             bg=BG_ENTRY, fg=FG_MAIN)
         self.desc.grid(row=0, column=1, sticky="we")
-        self.desc.bind("<<Modified>>", lambda e: self._mark_dirty())
-
-        # Track dirty on combobox / entry changes too
-        for var in (self.date_var, self.user_var, self.entry_type_var,
-                    self.effort_var, self.task_var):
-            var.trace_add("write", self._mark_dirty)
 
         btn_row = ttk.Frame(top)
         btn_row.grid(row=4, column=0, columnspan=8, sticky="w", pady=(8, 0))
@@ -3506,6 +3512,7 @@ class App:
                  font=("Segoe UI", 7), padx=12).pack(side="right", fill="y")
 
         self.update_task_state()
+        self._mark_clean()   # baseline for the unsaved-changes check
 
     # -----------------------------------------------------------------------
     # Real-time date validation
@@ -3564,9 +3571,16 @@ class App:
                 "task": "task_title", "effort": "effort", "description": "description",
             }
             field = key_map.get(self._sort_col, self._sort_col)
+            def _sort_key(x):
+                v = x[1].get(field, "")
+                if field == "effort":
+                    try:
+                        return (0, float(v), "")
+                    except (TypeError, ValueError):
+                        pass
+                return (1, 0.0, str(v))
             try:
-                indexed.sort(key=lambda x: str(x[1].get(field, "")),
-                             reverse=not self._sort_asc)
+                indexed.sort(key=_sort_key, reverse=not self._sort_asc)
             except Exception:
                 pass
 
@@ -3900,6 +3914,12 @@ class App:
         idx = self.selected_index()
         if idx is None:
             return
+        if self._form_dirty() and idx != self.edit_index:
+            if not messagebox.askyesno(
+                "Discard changes",
+                "The form has changes that are not saved.\nDiscard them and load the selected entry?",
+            ):
+                return
         a = normalise_activity(self.data[idx])
         self.edit_index = idx
         try:
@@ -3918,14 +3938,13 @@ class App:
         self.update_task_state()
 
     def cancel_edit(self, clear_desc: bool = False) -> None:
-        if not clear_desc and self._save_dirty and self.edit_index is not None:
+        if not clear_desc and self._form_dirty() and self.edit_index is not None:
             if not messagebox.askyesno(
                 "Cancel edit",
                 "You have unsaved changes in the form.\nDiscard them?",
             ):
                 return
         self.edit_index = None   # always reset
-        self._mark_clean()
         if clear_desc:
             self.desc.delete("1.0", "end")
             # Reset date to today or working week Monday
@@ -3944,6 +3963,7 @@ class App:
             self.entry_type_var.set("Activity")
             if hasattr(self, "wp_cb"):
                 self._populate_wp_cb()   # resets WP and task to first valid option
+        self._mark_clean()   # after the reset, so default values don't count as edits
 
     def duplicate_selected(self) -> None:
         idx = self.selected_index()
@@ -3984,6 +4004,7 @@ class App:
         self.desc.delete("1.0", "end")
         self.desc.insert("1.0", item.get("description", ""))
         self.update_task_state()
+        self._mark_clean()   # the copy is already in the table
         self._status("Entry duplicated — edit and save.")
 
     def _show_context_menu(self, event) -> None:
@@ -4159,16 +4180,8 @@ class App:
                 except Exception:
                     pass
 
-            # Merge: start with archive, add current entries not already there
-            # Use activity_key (full key incl. description) to avoid losing entries
-            seen = {activity_key(a) for a in from_archive}
-            merged = list(from_archive)
-            for a in from_current:
-                if activity_key(a) not in seen:
-                    merged.append(a)
-                    seen.add(activity_key(a))
-
-            merged = normalise_data(merged)
+            # Merge: in-progress entries replace their archived versions
+            merged = normalise_data(merge_entries(from_archive, from_current))
             merged.sort(key=lambda a: str(a.get("date", "")))
 
             self._push_undo("load current week")
@@ -4258,15 +4271,9 @@ class App:
                             merged.append(a)  # other user's entry → keep
                     merged.extend(entries)
                 else:
-                    # Foreign week — ONLY ADD, never remove existing entries
-                    # Use full activity_key (includes description) to avoid
-                    # collisions with existing entries of same task
-                    existing_full_keys = {activity_key(a) for a in existing}
-                    merged = list(existing)
-                    for a in entries:
-                        if activity_key(a) not in existing_full_keys:
-                            merged.append(a)
-                            existing_full_keys.add(activity_key(a))
+                    # Foreign week — never remove existing entries, but an entry
+                    # edited in the table replaces its archived version
+                    merged = merge_entries(existing, entries)
 
                 # Sort
                 merged = normalise_data(merged)
@@ -4465,7 +4472,13 @@ class App:
     # -----------------------------------------------------------------------
 
     def open_next_week_editor(self) -> None:
-        NextWeekEditor(self.root, self.tasks)
+        # Plan the week after the CW selected for the weekly summary
+        try:
+            base = (int(self.week_year.get()), int(self.cw_var.get()))
+            iso_week_monday(*base)
+        except (ValueError, TypeError):
+            base = iso_year_week_for_date(date.today())
+        NextWeekEditor(self.root, self.tasks, week_after(*base))
 
     # -----------------------------------------------------------------------
     # Statistics
@@ -4502,7 +4515,7 @@ class App:
             year = int(self.week_year.get())
             cw   = int(self.cw_var.get())
             start, end = cw_range(year, cw)
-            plan = load_next_week_plan()
+            plan = load_next_week_plan(week_after(year, cw))
             txt  = generate_weekly_text(
                 self.data, start.isoformat(), end.isoformat(),
                 cw=cw, year=year, next_week_plan=plan or None,
