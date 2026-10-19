@@ -971,6 +971,17 @@ def activity_key(a: dict) -> tuple:
 # Data normalisation / persistence
 # ---------------------------------------------------------------------------
 
+_CTRL_CHARS = {c: None for c in range(32) if chr(c) not in "\t\n\r"}
+_CTRL_CHARS.update({0x0b: "\n", 0x0c: "\n"})   # Word manual line/page break
+_CTRL_CHARS.update({0xfffe: None, 0xffff: None})
+
+
+def clean_text(text: str) -> str:
+    """Remove characters Word/XML cannot store (pasted from Word, Outlook,
+    PDFs): one of them in a description made the monthly report fail."""
+    return str(text).translate(_CTRL_CHARS)
+
+
 def normalise_activity(a: dict) -> dict:
     item = dict(a)
     if "description" not in item and "desc" in item:
@@ -980,8 +991,8 @@ def normalise_activity(a: dict) -> dict:
     for f in ("date", "user", "task_title", "description", "task_wp"):
         if item.get(f) is None:
             item[f] = ""
-        elif not isinstance(item[f], str):
-            item[f] = str(item[f])
+        else:
+            item[f] = clean_text(item[f])
     if item.get("entry_type") is None:
         item.pop("entry_type", None)
     if item.get("effort") is None:
@@ -1377,7 +1388,7 @@ def set_cell_text(cell, text: str, align_center: bool = True) -> None:
     """Set cell text, always using Calibri 11pt for consistency."""
     from docx.oxml.ns import qn as _qn
     from docx.oxml   import OxmlElement as _OxmlElement
-    text = str(text)
+    text = clean_text(text)
 
     def _apply_calibri(run):
         run.font.name = "Calibri"
@@ -5023,7 +5034,12 @@ class App:
             messagebox.showinfo("Done", f"Monthly Word report generated:\n{out}")
         except Exception as e:
             log.error("monthly: %s", e)
-            messagebox.showerror("Generation error", str(e))
+            if isinstance(e, PermissionError):
+                messagebox.showerror("Generation error",
+                                     f"Cannot write the report:\n{out}\n\n"
+                                     "Is it open in Word? Close it and try again.")
+            else:
+                messagebox.showerror("Generation error", str(e))
 
     # -----------------------------------------------------------------------
     # Help
