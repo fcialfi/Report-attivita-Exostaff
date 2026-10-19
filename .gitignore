@@ -1,0 +1,21 @@
+# Python / build
+__pycache__/
+*.spec
+build_log.txt
+_cfg_tmp.txt
+
+# Per-user runtime state (lives next to the exe)
+app_state.json
+activity_report.lock
+*.tmp
+
+# Office lock files
+~$*
+
+# Runtime data created when the script runs from this folder
+activities_current.json
+next_week_plan.json
+weekly_reports/
+backups/
+logs/
+monthly_reports/

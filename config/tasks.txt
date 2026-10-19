@@ -36,5 +36,5 @@
 24 | Support preparation activities for the future project reviews (e.g. SRR-2 of EPS-Aeolus, GS-CDR, System CDR of EPS-Sterna or similar) | Common | BrM FaC MaB
 25 | Provide Systems Engineering support to the EPS-Aeolus Ground Segment System Engineer in other areas as required | Common | BrM FaC MaB
 26 | Weekly report identifying the progress and status of the activities carried out | Common | BrM FaC MaB
-27 | Work package report to be submitted together with any invoice | BrM FaC MaB
-28 | Team Events | BrM FaC MaB
+27 | Work package report to be submitted together with any invoice | Common | BrM FaC MaB
+28 | Team Events | Common | BrM FaC MaB

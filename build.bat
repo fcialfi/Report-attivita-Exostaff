@@ -91,15 +91,21 @@ if errorlevel 1 ( echo [ERROR] Copy exe failed. Check network. & pause & exit /b
 echo  [OK] Exe deployed.
 
 copy /y "%DIST_DIR%\VERSION.txt" "%DATA_SHARE%\VERSION.txt" >nul
+if errorlevel 1 ( echo [ERROR] VERSION.txt copy failed - users will NOT be notified. & pause & exit /b 1 )
 echo  [OK] VERSION.txt updated.
 
 echo %EXE_SHARE%\%APP_NAME%.exe> "%DATA_SHARE%\EXE_LOCATION.txt"
 echo  [OK] EXE_LOCATION.txt updated.
 
 set TEMPLATE=EPS-Sterna and EPS-Aeolus System Engineering Service Template.docx
-if exist "%TEMPLATE%" (
-    copy /y "%TEMPLATE%" "%EXE_SHARE%\%TEMPLATE%" >nul
+set TEMPLATE_SRC=
+if exist "%TEMPLATE%" set "TEMPLATE_SRC=%TEMPLATE%"
+if exist "config\%TEMPLATE%" set "TEMPLATE_SRC=config\%TEMPLATE%"
+if defined TEMPLATE_SRC (
+    copy /y "%TEMPLATE_SRC%" "%EXE_SHARE%\%TEMPLATE%" >nul
     echo  [OK] Template copied.
+) else (
+    echo  [WARN] Template not found - not copied.
 )
 
 echo.

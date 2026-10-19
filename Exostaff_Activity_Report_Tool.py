@@ -24,6 +24,7 @@ import csv
 import os
 import sys
 import signal
+import socket
 import logging
 import traceback
 from collections import defaultdict
@@ -245,6 +246,13 @@ def auto_update(on_progress=None) -> tuple[bool, str]:
         return False, "Auto-update only works when running as compiled exe."
 
     dst = Path(sys.executable)
+    try:
+        same = src.resolve() == dst.resolve() or os.path.samefile(src, dst)
+    except OSError:
+        same = False
+    if same:
+        return False, ("You are running the exe directly from the shared folder.\n"
+                       "Copy it to your PC (e.g. Desktop) and start it from there.")
     progress(f"Copying from share…")
 
     # Copy new exe to a temp file next to current exe
@@ -257,14 +265,24 @@ def auto_update(on_progress=None) -> tuple[bool, str]:
     # Write launcher bat: waits for this process to exit, then renames
     # Does NOT restart automatically — user must reopen manually
     # (avoids DLL-in-use error with --onefile)
+    # Retries for up to ~60 s: a --onefile exe can stay locked for a while
+    # after the window closes (temp-dir cleanup, antivirus scan).
     launcher = dst.parent / "_update_launcher.bat"
     bat = (
-        '@echo off\n'
-        'timeout /t 3 /nobreak >nul\n'
-        f'move /y "{tmp}" "{dst}"\n'
-        'del "%~f0"\n'
+        '@echo off\r\n'
+        'chcp 65001 >nul\r\n'
+        'set /a n=0\r\n'
+        ':retry\r\n'
+        'timeout /t 2 /nobreak >nul\r\n'
+        f'move /y "{tmp}" "{dst}" >nul 2>&1\r\n'
+        'if not errorlevel 1 goto done\r\n'
+        'set /a n+=1\r\n'
+        'if %n% lss 30 goto retry\r\n'
+        'exit /b 1\r\n'
+        ':done\r\n'
+        'del "%~f0"\r\n'
     )
-    launcher.write_text(bat, encoding="utf-8")
+    launcher.write_bytes(bat.encode("utf-8"))
 
     import subprocess
     subprocess.Popen(
@@ -429,6 +447,12 @@ def load_users_from_config() -> list[str]:
     return users
 
 
+def _looks_like_initials(text: str) -> bool:
+    import re
+    tokens = text.split()
+    return bool(tokens) and all(re.fullmatch(r"[A-Z][a-z][A-Z]", t) for t in tokens)
+
+
 def load_tasks_from_config() -> tuple[list[tuple], dict[tuple, str], dict[tuple, list[str]], dict[tuple, str]]:
     """Load tasks from config/tasks.txt.
     Format: task_no | description | Project | [WP] | Initials
@@ -459,6 +483,10 @@ def load_tasks_from_config() -> tuple[list[tuple], dict[tuple, str], dict[tuple,
             continue
         title   = parts[1] if len(parts) > 1 else ""
         project = parts[2] if len(parts) > 2 else "Common"
+        # "N | title | BrM FaC" (project column missing) — don't take initials as project
+        if len(parts) == 3 and _looks_like_initials(project):
+            parts.append(project)
+            project = "Common"
         # parts[3] is WP if it looks like "WP6", "WP7", "SLM" etc.
         # otherwise it is initials
         wp    = ""
@@ -606,70 +634,127 @@ else:
 # Lock file (with PID-based stale detection)
 # ---------------------------------------------------------------------------
 
+LOCK_STALE_SECONDS  = 15 * 60          # lock without heartbeat for this long = orphan
+LOCK_HEARTBEAT_MS   = 5 * 60 * 1000    # how often a running instance refreshes its lock
+_HOST = socket.gethostname()
+_TS_FMT = "%Y-%m-%d %H:%M:%S"
+
+
 def _pid_is_running(pid: int) -> bool:
-    """Return True if the given PID is still an active process."""
+    """Return True if the given PID is an active process ON THIS MACHINE."""
     try:
         if sys.platform == "win32":
             import ctypes
-            SYNCHRONIZE = 0x00100000
-            handle = ctypes.windll.kernel32.OpenProcess(SYNCHRONIZE, False, pid)
-            if handle == 0:
-                return False  # process does not exist
-            # Check if process has exited
+            PROCESS_QUERY_LIMITED_INFORMATION = 0x1000   # required by GetExitCodeProcess
+            ERROR_ACCESS_DENIED = 5
             STILL_ACTIVE = 259
-            code = ctypes.c_ulong(0)
-            ctypes.windll.kernel32.GetExitCodeProcess(handle, ctypes.byref(code))
-            ctypes.windll.kernel32.CloseHandle(handle)
-            return code.value == STILL_ACTIVE
-        else:
-            os.kill(pid, 0)
-            return True
+            k32 = ctypes.windll.kernel32
+            handle = k32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+            if not handle:
+                # Access denied means the process exists (e.g. another user's)
+                return k32.GetLastError() == ERROR_ACCESS_DENIED
+            try:
+                code = ctypes.c_ulong(0)
+                if not k32.GetExitCodeProcess(handle, ctypes.byref(code)):
+                    return True   # cannot tell — assume alive (safer)
+                return code.value == STILL_ACTIVE
+            finally:
+                k32.CloseHandle(handle)
+        os.kill(pid, 0)
+        return True
+    except PermissionError:
+        return True
     except (OSError, ProcessLookupError):
         return False
     except Exception:
         return False
 
 
+def _read_lock() -> dict | None:
+    try:
+        return json.loads(lock_file().read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return None
+    except Exception as exc:
+        log.warning("lock file unreadable: %s", exc)
+        return {}
+
+
+def _lock_is_ours(info: dict | None) -> bool:
+    return bool(info) and info.get("host") == _HOST and info.get("pid") == os.getpid()
+
+
+def _lock_is_stale(info: dict) -> bool:
+    """Same machine: check the PID. Other machine: a PID means nothing here,
+    so rely on the heartbeat timestamp the owner refreshes periodically."""
+    pid = info.get("pid")
+    if info.get("host") == _HOST and pid:
+        return not _pid_is_running(int(pid))
+    ts = info.get("heartbeat") or info.get("since")
+    try:
+        age = (datetime.now() - datetime.strptime(ts, _TS_FMT)).total_seconds()
+    except Exception:
+        return True   # malformed lock
+    return age > LOCK_STALE_SECONDS
+
+
+def _write_lock(since: str | None = None) -> None:
+    now = datetime.now().strftime(_TS_FMT)
+    info = {
+        "user":      os.environ.get("USERNAME") or os.environ.get("USER") or "unknown",
+        "host":      _HOST,
+        "pid":       os.getpid(),
+        "since":     since or now,
+        "heartbeat": now,
+    }
+    lock_file().write_text(json.dumps(info), encoding="utf-8")
+
+
 def acquire_lock() -> bool:
     # Can only lock once IO folder is set (lock lives on the share)
     if not _io_root:
         return True  # no IO folder yet — let the user through
-    if lock_file().exists():
-        try:
-            info = json.loads(lock_file().read_text(encoding="utf-8"))
-            pid  = info.get("pid")
-            if pid and _pid_is_running(int(pid)):
-                return False   # process alive → lock valid
-            # Stale lock (process dead or no PID) — auto-clear
-            log.warning("Stale lock detected (PID %s) — auto-clearing.", pid)
-            lock_file().unlink(missing_ok=True)
-        except Exception as exc:
-            log.warning("acquire_lock read failed: %s", exc)
-            lock_file().unlink(missing_ok=True)
+    info = _read_lock()
+    if info is not None and not _lock_is_ours(info):
+        if info and not _lock_is_stale(info):
+            return False   # held by a live instance
+        log.warning("Stale lock detected (%s) — auto-clearing.", info)
     try:
-        info = {
-            "user":  os.environ.get("USERNAME") or os.environ.get("USER") or "unknown",
-            "since": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-            "pid":   os.getpid(),
-        }
-        lock_file().write_text(json.dumps(info), encoding="utf-8")
+        _write_lock()
         return True
     except Exception as exc:
         log.warning("acquire_lock write failed: %s", exc)
         return True   # on error, let the user through
 
 
+def refresh_lock() -> bool:
+    """Heartbeat: rewrite our lock timestamp. Returns False if someone else
+    took the lock over (e.g. Force Unlock from another PC)."""
+    if not _io_root:
+        return True
+    info = _read_lock()
+    if info is not None and info and not _lock_is_ours(info):
+        return False
+    try:
+        _write_lock(since=(info or {}).get("since"))
+    except Exception as exc:
+        log.warning("refresh_lock failed: %s", exc)
+    return True
+
+
 def read_lock_info() -> str:
-    try:
-        info = json.loads(lock_file().read_text(encoding="utf-8"))
-        return f"{info.get('user', '?')} (since {info.get('since', '?')}, PID {info.get('pid', '?')})"
-    except Exception:
+    info = _read_lock()
+    if not info:
         return "another user"
+    return (f"{info.get('user', '?')} on {info.get('host', '?')} "
+            f"(since {info.get('since', '?')}, last seen {info.get('heartbeat', '?')})")
 
 
-def release_lock() -> None:
+def release_lock(force: bool = False) -> None:
+    """Remove the lock — only if it is ours, unless force=True (Force Unlock)."""
     try:
-        lock_file().unlink(missing_ok=True)
+        if force or _lock_is_ours(_read_lock()):
+            lock_file().unlink(missing_ok=True)
     except Exception as exc:
         log.warning("release_lock failed: %s", exc)
 
@@ -785,14 +870,23 @@ def current_week_file_for_date(d: date) -> Path:
     return d / f"week_{y}_CW{cw:02d}.json"
 
 def _stable_key_fn(a: dict) -> tuple:
-    """Identify an entry by date + user + type + task_no.
-    Used for merge/delete tracking — ignores editable fields like description/effort."""
+    """Identify an entry by date + user + type + WP + task_no.
+    Used for merge/delete tracking — ignores editable fields like description/effort.
+    WP is part of the key because task numbers can repeat across WPs."""
     return (
         str(a.get("date", "")),
         str(a.get("user", "")),
         str(a.get("entry_type", "")),
+        str(a.get("task_wp", "") or ""),
         str(a.get("task_no", "")),
     )
+
+
+def merge_entries(base: list, overrides: list) -> list:
+    """Return base + overrides, where overrides REPLACE base entries with the same
+    stable key (so an edited entry never coexists with its old version)."""
+    keys = {_stable_key_fn(a) for a in overrides}
+    return [a for a in base if _stable_key_fn(a) not in keys] + list(overrides)
 
 
 def activity_key(a: dict) -> tuple:
@@ -855,11 +949,23 @@ def normalise_activity(a: dict) -> dict:
 def normalise_data(data: list) -> list:
     return [normalise_activity(a) for a in data]
 
+def atomic_write_json(path: Path, obj) -> None:
+    """Write JSON via temp file + rename, so a network drop or crash mid-write
+    never leaves a truncated file on the share."""
+    text = json.dumps(obj, indent=2, ensure_ascii=False)
+    tmp  = path.with_name(path.name + ".tmp")
+    try:
+        tmp.write_text(text, encoding="utf-8")
+        os.replace(tmp, path)
+    except OSError as exc:
+        # e.g. OneDrive/antivirus holding the target — fall back to direct write
+        log.warning("atomic write failed for %s (%s) — writing directly", path, exc)
+        path.write_text(text, encoding="utf-8")
+        tmp.unlink(missing_ok=True)
+
+
 def write_json(data: list) -> None:
-    data_file().write_text(
-        json.dumps(normalise_data(data), indent=2, ensure_ascii=False),
-        encoding="utf-8",
-    )
+    atomic_write_json(data_file(), normalise_data(data))
 
 def save_weekly_archive(data: list, ref_date: date | None = None) -> Path | None:
     if ref_date is None:
@@ -873,17 +979,16 @@ def save_weekly_archive(data: list, ref_date: date | None = None) -> Path | None
         try:
             existing = normalise_data(json.loads(week_file.read_text(encoding="utf-8")))
         except Exception as exc:
-            log.warning("Could not read existing weekly archive %s: %s", week_file, exc)
-    existing_keys = {activity_key(a) for a in existing}
-    added = 0
-    for item in data:
-        key = activity_key(item)
-        if key not in existing_keys:
-            existing.append(item)
-            existing_keys.add(key)
-            added += 1
-    week_file.write_text(json.dumps(existing, indent=2, ensure_ascii=False), encoding="utf-8")
-    return week_file if added > 0 or week_file.exists() else None
+            # Do not overwrite an unreadable archive — that would lose its content
+            log.error("Could not read existing weekly archive %s: %s", week_file, exc)
+            raise RuntimeError(f"Weekly archive {week_file.name} is unreadable; "
+                               f"not overwritten. Check the file.") from exc
+    # Entries passed in win over archived versions with the same stable key,
+    # otherwise an entry edited after a previous archive would be stored twice.
+    merged = merge_entries(existing, data)
+    merged.sort(key=lambda a: (str(a.get("date", "")), str(a.get("user", ""))))
+    atomic_write_json(week_file, merged)
+    return week_file
 
 def reset_if_new_week(data: list) -> tuple[list, bool, Path | None]:
     """Auto-archive past weeks. Groups by week so each lands in its own file."""
@@ -941,16 +1046,38 @@ def reset_if_new_week(data: list) -> tuple[list, bool, Path | None]:
     write_json(current_from_archive)
     return current_from_archive, True, last_saved
 
+# Set when the data file could not be read — shown to the user by the App
+data_load_warning: str | None = None
+
+
 def read_json() -> tuple[list, bool, Path | None]:
+    global data_load_warning
+    data_load_warning = None
     if data_file().exists():
         try:
             data = normalise_data(json.loads(data_file().read_text(encoding="utf-8")))
-            data, reset_done, saved_file = reset_if_new_week(data)
-            data_file().write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
-            return data, reset_done, saved_file
         except Exception as exc:
             log.error("read_json failed: %s", exc)
+            # Keep a copy before the next save overwrites the damaged file
+            dest = backups_dir() / f"corrupt_{datetime.now():%Y%m%d_%H%M%S}_{data_file().name}"
+            try:
+                shutil.copy2(data_file(), dest)
+            except Exception as copy_exc:
+                log.error("could not back up corrupt data file: %s", copy_exc)
+                dest = None
+            data_load_warning = (
+                f"The current activity file could not be read:\n{exc}\n\n"
+                + (f"A copy was saved to:\n{dest}\n\n" if dest else "")
+                + "Weekly archives are not affected. Use 'Load CW' to reload a week."
+            )
             return [], False, None
+        try:
+            data, reset_done, saved_file = reset_if_new_week(data)
+        except Exception as exc:
+            log.error("auto-archive failed: %s", exc)
+            data_load_warning = f"Automatic weekly archive failed:\n{exc}"
+            return data, False, None
+        return data, reset_done, saved_file
     return [], False, None
 
 def load_monthly_data_from_weekly_reports(year: int, month: int) -> list:
@@ -1380,7 +1507,7 @@ def load_next_week_plan() -> dict[str, list[str]]:
 
 def save_next_week_plan(plan: dict[str, list[str]]) -> None:
     try:
-        next_week_file().write_text(json.dumps(plan, indent=2, ensure_ascii=False), encoding="utf-8")
+        atomic_write_json(next_week_file(), plan)
     except Exception as exc:
         log.warning("save_next_week_plan failed: %s", exc)
 
@@ -1448,7 +1575,45 @@ def generate_weekly_text(
 # Monthly Word generation
 # ---------------------------------------------------------------------------
 
-def generate_monthly_docx(template_path, data: list, year: int, month: int, out_path: str) -> None:
+def _norm_title(text: str) -> str:
+    """Lower-case, collapse whitespace and drop trailing punctuation for title matching."""
+    return " ".join(str(text or "").lower().split()).rstrip(" .;:")
+
+
+def _match_template_row(entry: dict, task_rows: list[tuple], table_wp: str) -> int | None:
+    """Return the row index of the template task row an entry belongs to.
+    task_rows: [(row_idx, task_no, normalised_title), ...]
+    Title match wins over number match, because task numbers in tasks.txt
+    (which may restart per WP) do not have to follow the template numbering.
+    """
+    title = _norm_title(entry.get("task_title", ""))
+    n     = int(entry.get("task_no", 0) or 0)
+    wp    = entry.get("task_wp", "")
+    if title:
+        exact = [r for r in task_rows if r[2] == title]
+        cont  = [r for r in task_rows if r[2] and (title in r[2] or r[2] in title)]
+        for cands in (exact, cont):
+            if len(cands) == 1:
+                return cands[0][0]
+            same_no = [r for r in cands if r[1] == n]
+            if same_no:
+                return same_no[0][0]
+        # Near-identical wording (e.g. template adds "(e.g. ...)")
+        import difflib
+        scored = sorted(((difflib.SequenceMatcher(None, title, r[2]).ratio(), r[0])
+                         for r in task_rows if r[2]), reverse=True)
+        if scored and scored[0][0] >= 0.85 and (len(scored) == 1 or scored[1][0] < scored[0][0] - 0.05):
+            return scored[0][1]
+    # Number fallback only when the numbering scheme can be trusted
+    if not wp or not table_wp or wp == table_wp:
+        for r in task_rows:
+            if r[1] == n:
+                return r[0]
+    return None
+
+
+def generate_monthly_docx(template_path, data: list, year: int, month: int, out_path: str) -> list[str]:
+    """Fill the Word template. Returns warnings for entries that could not be placed."""
     doc        = Document(template_path)
     month_start = date(year, month, 1)
     month_end   = last_day_of_month(year, month)
@@ -1498,6 +1663,7 @@ def generate_monthly_docx(template_path, data: list, year: int, month: int, out_
         )
 
     user_efforts: dict[str, float] = {}
+    unmapped: list[str] = []
     for user, table in user_tables:
         total_effort = 0.0
         # Detect which WP this table belongs to from header row
@@ -1517,38 +1683,28 @@ def generate_monthly_docx(template_path, data: list, year: int, month: int, out_
                 break
 
         rows = list(table.rows)
+        task_rows = [
+            (idx, int(r.cells[0].text.strip()), _norm_title(r.cells[1].text))
+            for idx, r in enumerate(rows) if r.cells[0].text.strip().isdigit()
+        ]
+        # Assign every entry of this user to exactly ONE template row, so that
+        # effort can never be counted twice (or silently dropped).
+        acts_by_row: dict[int, list] = defaultdict(list)
+        for (u, n, wp), entries in activities_by_user_task.items():
+            if u != user:
+                continue
+            row_idx = _match_template_row(entries[0], task_rows, table_wp)
+            if row_idx is None:
+                pd = sum(float(a.get("effort", 0) or 0) for a in entries)
+                unmapped.append(f"{user}: {wp + ' ' if wp else ''}task {n} "
+                                f"({format_effort(pd)} PD) — not found in template")
+                continue
+            acts_by_row[row_idx].extend(entries)
+
         for idx, r in enumerate(rows):
             c0 = r.cells[0].text.strip()
             if c0.isdigit():
-                task_no = int(c0)
-                # Match entries by user + task_no + WP
-                acts = []
-                # Get task title from next row for fallback matching
-                task_title_template = ""
-                if idx + 1 < len(rows):
-                    task_title_template = rows[idx].cells[1].text.strip().lower()
-                for (u, n, wp), entries in activities_by_user_task.items():
-                    if u != user:
-                        continue
-                    if n == task_no:
-                        # If table has a WP, only match entries of that WP
-                        if table_wp and wp and wp != table_wp:
-                            continue
-                        acts.extend(entries)
-                # Fallback: if no acts found, try matching by task title similarity
-                if not acts and task_title_template:
-                    for (u, n, wp), entries in activities_by_user_task.items():
-                        if u != user:
-                            continue
-                        if table_wp and wp and wp != table_wp:
-                            continue
-                        # Check if any entry title matches template title
-                        for e in entries:
-                            et = e.get("task_title", "").lower()
-                            if et and (et[:30] in task_title_template or
-                                       task_title_template[:30] in et):
-                                acts.extend(entries)
-                                break
+                acts    = acts_by_row.get(idx, [])
                 effort  = sum(float(a.get("effort", 0) or 0) for a in acts)
                 total_effort += effort
                 set_cell_text(r.cells[2], format_effort(effort))
@@ -1634,6 +1790,9 @@ def generate_monthly_docx(template_path, data: list, year: int, month: int, out_
                 center_cell_content(cell)
     doc.save(out_path)
     patch_month_and_date_in_docx_file(out_path, year, month)
+    for msg in unmapped:
+        log.warning("monthly: %s", msg)
+    return unmapped
 
 # ---------------------------------------------------------------------------
 # Excel export
@@ -1985,7 +2144,7 @@ def show_lock_error(root: tk.Tk, owner: str) -> None:
     dialog.grab_set()
     root.wait_window(dialog)
     if result["force"]:
-        release_lock()
+        release_lock(force=True)
         if not acquire_lock():
             messagebox.showerror("Lock error", "Could not acquire lock even after force unlock. Exiting.")
             root.destroy(); sys.exit(1)
@@ -2584,10 +2743,14 @@ class App:
         if not saved_tpl:
             _tpl_dirs = []
             if self.last_io_dir:
-                _tpl_dirs.append(Path(self.last_io_dir))
+                _tpl_dirs += [Path(self.last_io_dir) / "config", Path(self.last_io_dir)]
             _tpl_dirs.append(_exe_dir())
             for _td in _tpl_dirs:
-                _found = list(_td.glob("*.docx"))
+                # Prefer files named like the template; skip Word lock files (~$...)
+                _found = sorted(
+                    (f for f in _td.glob("*.docx") if not f.name.startswith("~$")),
+                    key=lambda f: ("template" not in f.name.lower(), f.name),
+                )
                 if _found:
                     saved_tpl = _found[0]
                     log.warning("Auto-detected template: %s", saved_tpl)
@@ -2655,6 +2818,12 @@ class App:
         root.deiconify()
         root.lift()
         root.focus_force()
+
+        if _running_as_exe:
+            self.root.after(LOCK_HEARTBEAT_MS, self._lock_heartbeat)
+
+        if data_load_warning:
+            messagebox.showwarning("Data file problem", data_load_warning)
 
         # Show warning if saved working folder was not found
         if getattr(self, "_pending_folder_warning", None):
@@ -2749,6 +2918,10 @@ class App:
                 "You have unsaved changes in the form.\nExit anyway?",
             ):
                 return
+        self._shutdown()
+
+    def _shutdown(self) -> None:
+        """Persist state, release the shared lock and close."""
         save_app_state(
             self.template_path, self.users, self.tasks,
             self.user_var.get() if hasattr(self, "user_var") else "",
@@ -2756,6 +2929,19 @@ class App:
         )
         release_lock()
         self.root.destroy()
+
+    def _lock_heartbeat(self) -> None:
+        """Keep our lock fresh so other PCs don't treat it as orphaned."""
+        if not refresh_lock():
+            log.warning("Lock taken over by %s", read_lock_info())
+            messagebox.showwarning(
+                "Lock taken over",
+                f"Another user has forced the unlock:\n{read_lock_info()}\n\n"
+                "Changes saved from now on may overwrite theirs. "
+                "Please coordinate and close the application.",
+            )
+            return   # stop heartbeat — lock is no longer ours
+        self.root.after(LOCK_HEARTBEAT_MS, self._lock_heartbeat)
 
     def _push_undo(self, description: str) -> None:
         import copy
@@ -2775,6 +2961,9 @@ class App:
         entry = self._undo_stack.pop()
         desc, snapshot = entry[0], entry[1]
         self.data = snapshot
+        self.edit_index = None            # indices may no longer match
+        self._pending_duplicate_idx = None
+        self._mark_clean()
         # Restore week state if snapshot includes it
         if len(entry) >= 4:
             self._working_week     = entry[2]
@@ -3406,7 +3595,10 @@ class App:
             # Default: first non-SLM WP, or first WP
             default = next((w for w in wps if w.upper() != "SLM"), wps[0])
             self.wp_var.set(default)
-            self._on_wp_changed(init=True)
+        else:
+            # tasks.txt without WP column — show every task
+            self.wp_var.set("")
+        self._on_wp_changed(init=True)
 
     def _on_wp_changed(self, init: bool = False) -> None:
         """Filter task list to selected WP."""
@@ -3491,7 +3683,7 @@ class App:
         try:
             entry_date = safe_date(self.date_var.get())
         except Exception:
-            messagebox.showerror("Input error", "Date must be YYYY-MM-DD.")
+            messagebox.showerror("Input error", "Date must be DD/MM/YY (or DD/MM/YYYY).")
             return
         try:
             effort = float(self.effort_var.get().replace(",", "."))
@@ -3508,24 +3700,25 @@ class App:
             ):
                 return
         # Warn if total effort for this date+user would exceed 1.0 PD
-        if self.edit_index is None:
-            try:
-                same_day = [
-                    a for a in self.data
-                    if a.get("date") == entry_date.isoformat()
-                    and a.get("user") == self.user_var.get()
-                    and a.get("entry_type") == "Activity"
-                ]
-                day_total = sum(float(a.get("effort", 0) or 0) for a in same_day) + effort
-                if day_total > 1.0:
-                    if not messagebox.askyesno(
-                        "Daily total warning",
-                        f"Total effort for {entry_date.isoformat()} ({self.user_var.get()}) "
-                        f"would be {day_total:g} PD.\n\nSave anyway?",
-                    ):
-                        return
-            except Exception:
-                pass
+        # (when editing, the entry's old value is excluded)
+        try:
+            same_day = [
+                a for i, a in enumerate(self.data)
+                if i != self.edit_index
+                and a.get("date") == entry_date.isoformat()
+                and a.get("user") == self.user_var.get()
+                and a.get("entry_type") == "Activity"
+            ]
+            day_total = sum(float(a.get("effort", 0) or 0) for a in same_day) + effort
+            if day_total > 1.0:
+                if not messagebox.askyesno(
+                    "Daily total warning",
+                    f"Total effort for {entry_date.isoformat()} ({self.user_var.get()}) "
+                    f"would be {day_total:g} PD.\n\nSave anyway?",
+                ):
+                    return
+        except Exception:
+            pass
         # No week restriction — entries from any week can coexist in the table.
         # Auto-archiving happens automatically on startup when a new week begins.
         entry_type = self.entry_type_var.get()
@@ -3686,7 +3879,7 @@ class App:
         self.user_var.set(item.get("user", ""))
         self.entry_type_var.set(item.get("entry_type", "Activity"))
         if item.get("entry_type") == "Activity":
-            self.task_var.set(f"{item.get('task_no')} - {item.get('task_title')}")
+            self._update_wp_and_task_from_entry(item)   # restores WP too
         self.effort_var.set(str(item.get("effort", "1")))
         self.desc.delete("1.0", "end")
         self.desc.insert("1.0", item.get("description", ""))
@@ -3706,6 +3899,15 @@ class App:
         if messagebox.askyesno("Delete", "Delete selected entry?"):
             self._push_undo("delete entry")
             self.data.pop(idx)
+            # Keep the entry being edited pointing at the right row
+            if self.edit_index is not None:
+                if self.edit_index == idx:
+                    self.edit_index = None
+                    self._mark_clean()
+                elif self.edit_index > idx:
+                    self.edit_index -= 1
+            if self._pending_duplicate_idx is not None and self._pending_duplicate_idx >= idx:
+                self._pending_duplicate_idx = None
             write_json(self.data)
             self._set_table_dirty()
             self.refresh()
@@ -3971,10 +4173,7 @@ class App:
                 merged.sort(key=lambda a: (str(a.get("date", "")),
                                            str(a.get("user", ""))))
 
-                week_file.write_text(
-                    json.dumps(merged, indent=2, ensure_ascii=False),
-                    encoding="utf-8",
-                )
+                atomic_write_json(week_file, merged)
                 saved.append(f"CW{cw:02d}/{y} ({len(merged)} entries)")
 
             auto_backup(self.data, force=True)   # always backup on Save week
@@ -4024,6 +4223,7 @@ class App:
         if p.name.lower() == "weekly_reports":
             d = str(p.parent)
 
+        release_lock()   # lock of the previous folder (no-op if not ours)
         set_io_dir(d)
         self.last_io_dir = str(get_io_root())
         self._io_dir_var.set(self.last_io_dir)
@@ -4040,7 +4240,11 @@ class App:
             return
 
         # Load data from share (same as startup)
+        self.edit_index = None
+        self._undo_stack.clear()   # snapshots belong to the previous folder
         self.data, was_reset, saved_file = read_json()
+        if data_load_warning:
+            messagebox.showwarning("Data file problem", data_load_warning)
         if self.data:
             try:
                 ref = max(safe_date(a["date"]) for a in self.data if a.get("date"))
@@ -4169,18 +4373,20 @@ class App:
             y, m = map(int, self.month_var.get().split("-"))
         except Exception:
             messagebox.showerror("Input error", "Month must be YYYY-MM."); return
-        all_data = load_monthly_data_from_weekly_reports(y, m)
-        seen = {activity_key(a) for a in all_data}
+        all_data = merge_entries(load_monthly_data_from_weekly_reports(y, m),
+                                 self._table_entries_in_month(y, m))
+        StatsWindow(self.root, all_data, y, m)
+
+    def _table_entries_in_month(self, y: int, m: int) -> list:
+        out = []
         for item in normalise_data(self.data):
             try:
                 d = safe_date(item["date"])
             except Exception:
                 continue
             if date(y, m, 1) <= d <= last_day_of_month(y, m):
-                key = activity_key(item)
-                if key not in seen:
-                    all_data.append(item); seen.add(key)
-        StatsWindow(self.root, all_data, y, m)
+                out.append(item)
+        return out
 
     # -----------------------------------------------------------------------
     # Report generation
@@ -4313,21 +4519,14 @@ class App:
                 monthly_data = load_monthly_data_from_weekly_reports(y, m)
                 log.warning("monthly: loaded %d entries from archives", len(monthly_data))
 
-                seen = {_stable_key_fn(a) for a in monthly_data}
-                for item in normalise_data(self.data):
-                    try: d = safe_date(item["date"])
-                    except Exception: continue
-                    if date(y, m, 1) <= d <= last_day_of_month(y, m):
-                        sk = _stable_key_fn(item)
-                        if sk not in seen:
-                            monthly_data.append(item); seen.add(sk)
+                # Table entries (possibly edited, not yet saved) win over archive
+                monthly_data = merge_entries(monthly_data, self._table_entries_in_month(y, m))
 
                 log.warning("monthly: total %d entries after merge", len(monthly_data))
 
                 if not monthly_data:
                     result["skip"] = True
-                    self.root.after(0, dlg.close)
-                    return
+                    return   # dialog closed in finally
 
                 # Check user name consistency
                 from docx import Document as _Doc
@@ -4344,7 +4543,8 @@ class App:
                 result["warn"] = _warn
                 result["monthly_data"] = monthly_data
 
-                generate_monthly_docx(self.template_path, monthly_data, y, m, out)
+                result["unmapped"] = generate_monthly_docx(
+                    self.template_path, monthly_data, y, m, out)
                 log.warning("monthly: DONE — weekly files still present: %s",
                             [f.name for f in weekly_dir().glob("week_*_CW*.json")])
             except Exception as exc:
@@ -4369,6 +4569,15 @@ class App:
                 ):
                     return
                 generate_monthly_docx(self.template_path, [], y, m, out)
+
+            if result.get("unmapped"):
+                messagebox.showwarning(
+                    "Entries not in report",
+                    "These entries could not be matched to a task row of the template "
+                    "and are NOT included in the report:\n\n"
+                    + "\n".join(result["unmapped"][:20])
+                    + "\n\nCheck task titles/numbers in config/tasks.txt against the template.",
+                )
 
             if result.get("warn"):
                 messagebox.showwarning(
@@ -4926,7 +5135,7 @@ will show the new version number on next launch.
                             f"Reopen it from:\n{d}",
                             parent=win,
                         )
-                        self.root.destroy()
+                        self._shutdown()
                     self.root.after(0, _finish)
                 elif not ok:
                     self.root.after(0, lambda: [
