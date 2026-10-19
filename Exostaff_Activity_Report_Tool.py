@@ -958,6 +958,17 @@ def normalise_activity(a: dict) -> dict:
     item = dict(a)
     if "description" not in item and "desc" in item:
         item["description"] = item.get("desc", "")
+    # null / missing text fields (hand-edited JSON) would crash the table
+    # refresh — at startup too, making the tool unusable for everybody
+    for f in ("date", "user", "task_title", "description", "task_wp"):
+        if item.get(f) is None:
+            item[f] = ""
+        elif not isinstance(item[f], str):
+            item[f] = str(item[f])
+    if item.get("entry_type") is None:
+        item.pop("entry_type", None)
+    if item.get("effort") is None:
+        item["effort"] = 0
     if "effort" not in item:
         item["effort"] = 1
     # Same formats everywhere: ISO date and numeric effort (files edited in
@@ -4158,7 +4169,10 @@ class App:
             return
         if not messagebox.askyesno(
             "Reset",
-            "All current entries will be permanently deleted.\n\nContinue?",
+            "The table will be cleared.\n\n"
+            "Entries already saved to the weekly archive are NOT deleted and still "
+            "count in the monthly report — to remove them, load the week and delete "
+            "them there.\n\nContinue?",
         ):
             return
         try:
@@ -4424,6 +4438,7 @@ class App:
 
         # Load data from share (same as startup)
         self.edit_index = None
+        self._working_week = None   # belongs to the previous folder
         self._undo_stack.clear()   # snapshots belong to the previous folder
         self.data, was_reset, saved_file = read_json()
         if data_load_warning:
