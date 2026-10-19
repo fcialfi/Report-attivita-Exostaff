@@ -1,0 +1,2 @@
+EXE_SHARE=N:\temp\Fabio\Exostaff Report Generator
+DATA_SHARE=N:\temp\Fabio\Exostaff Report Generator

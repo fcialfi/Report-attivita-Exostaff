@@ -1,0 +1,40 @@
+	# Task list — one per line
+# Format: task_no | Task description | Project | Initials (space-separated)
+# Project must be: EPS-Sterna, EPS-Aeolus, or Common
+# Initials are used in the monthly Word report summary table
+# Lines starting with # are comments
+#
+# ── EPS-Sterna ──────────────────────────────────────────────────────────────
+1  | Contribution to the closure of any follow-on actions triggered by the EPS-Sterna Ground Segment PDR | EPS-Sterna | BrM FaC MaB
+2  | Support refining/maintaining the EPS-Sterna MSRD and GSRD VCDs and harmonisation of the lower level VCDs | EPS-Sterna | BrM FaC
+3  | Support advancing and completion of EPS-Sterna interface or any other documents during detailed design required for GS or System CDR | EPS-Sterna | BrM FaC MaB
+4  | Contribute to EPS-Sterna RF Suitcase and NDIU documentation and refine the existing ones as necessary | EPS-Sterna | BrM FaC MaB
+5  | Contribution to EPS-Sterna RF compatibility verification activities and documentation | EPS-Sterna | BrM FaC MaB
+6  | Complete RF characterisation/compatibility testing based on Arctic Weather Satellite signal recording and replaying and generate all test documentation needed | EPS-Sterna | BrM FaC MaB
+7  | Contribute to the preparation of test plans and test specifications for EPS-Sterna System Verification activities involving RF suitcase and NDIU | EPS-Sterna | BrM FaC MaB
+8  | Contribution to EPS-Sterna IV&V campaigns planning and related documentation | EPS-Sterna | BrM FaC MaB
+9  | Contribution to the development and verification of the EPS-Sterna SATSIM and exploitation of the SATSIM prototype as a pre-available tool for the operations preparation activities | EPS-Sterna | BrM FaC MaB
+10  | Contribution to the preparation of the EPS-Sterna operations preparation documentation as needed (e.g. Flight Operations Procedures (FOP), populating the operation static data (OSD), the operation baseline documentation (OBD) database) | EPS-Sterna | BrM FaC MaB
+11  | Contribution to the preparation of the EPS-Sterna operational validation documentation as needed (e.g. pre-SVT, SVT, OSV test documentation (specification, procedure, report) | EPS-Sterna | BrM FaC MaB
+12  | Contribution to the EPS-Sterna LEOP & SIOV planning as necessary | EPS-Sterna | BrM FaC MaB
+13  | Preparation of presentations summarizing outcome of discussions and analyses on the work being done | EPS-Sterna | BrM FaC MaB
+14  | Support/Contribute preparation activities for the EPS-Sterna project reviews from operations preparation point of view (e.g. GS-CDR, System CDR or similar) | EPS-Sterna | BrM FaC MaB
+
+#
+# ── EPS-Aeolus ──────────────────────────────────────────────────────────────
+15 | Maintenance of EPS-Aeolus System and Ground Segment VCDs exported from DOORS/VERDI | EPS-Aeolus | BrM FaC MaB
+16 | Maintenance of EPS-Aeolus System and GS IV&V Plan, Space-to-Ground IRD and RF Suitcases Requirements Document | EPS-Aeolus | BrM FaC MaB
+17 | Support the maintenance and update of the EPS-Aeolus ESA SSRD DOORS module | EPS-Aeolus | BrM FaC MaB
+18 | Support the maintenance and update of the EPS-Aeolus SRD DOORS module including generation of Trace document | EPS-Aeolus | BrM FaC MaB
+#
+# ── Common ──────────────────────────────────────────────────────────────────
+19 | Contribution to design activities linked to system modelling and architecture | Common | BrM FaC MaB
+20 | Contribution to the requirement traceability and maintenance | Common | BrM FaC MaB
+21 | Contribute to the update and maintenance of system and/or ground segment technical budgets | Common | BrM FaC MaB
+22 | Participation in any necessary meeting to progress on the design/definition of EPS-Aeolus and EPS-Sterna ground segment, system and/or IV&V activities | Common | BrM FaC MaB
+23 | Preparation of presentations summarizing outcome of discussions and analysis on the work being done | Common | BrM FaC MaB
+24 | Support preparation activities for the future project reviews (e.g. SRR-2 of EPS-Aeolus, GS-CDR, System CDR of EPS-Sterna or similar) | Common | BrM FaC MaB
+25 | Provide Systems Engineering support to the EPS-Aeolus Ground Segment System Engineer in other areas as required | Common | BrM FaC MaB
+26 | Weekly report identifying the progress and status of the activities carried out | Common | BrM FaC MaB
+27 | Work package report to be submitted together with any invoice | BrM FaC MaB
+28 | Team Events | BrM FaC MaB

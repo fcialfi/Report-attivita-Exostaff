@@ -1,0 +1,6 @@
+# List of users — one per line
+# Format: First LASTNAME
+# Lines starting with # are comments
+Bruno MORABITO
+Fabio CIALFI
+Marco BRUNO
