@@ -3170,6 +3170,7 @@ class App:
         root.focus_force()
 
         if _running_as_exe:
+            self._heartbeat_on = True
             self.root.after(LOCK_HEARTBEAT_MS, self._lock_heartbeat)
         self.root.after(UPDATE_CHECK_MS, self._periodic_update_check)
 
@@ -3299,8 +3300,20 @@ class App:
                 "Changes made since the last save are kept in this window only. "
                 "Close and reopen the tool when they are done.",
             )
+            self._heartbeat_on = False
             return   # stop heartbeat — lock is no longer ours
         self.root.after(LOCK_HEARTBEAT_MS, self._lock_heartbeat)
+
+    def _lock_regained(self) -> None:
+        """We hold the lock again (e.g. folder re-selected after a takeover):
+        leave read-only and make sure the lock keeps being refreshed."""
+        global read_only
+        if read_only:
+            read_only = False
+            self.root.title(APP_TITLE)
+        if not getattr(self, "_heartbeat_on", False):
+            self._heartbeat_on = True
+            self.root.after(LOCK_HEARTBEAT_MS, self._lock_heartbeat)
 
     def _writable(self) -> bool:
         """False (with a message) when the tool is read-only."""
@@ -4362,6 +4375,8 @@ class App:
             year = int(self.week_year.get())
             cw   = int(self.cw_var.get())
             iso_week_monday(year, cw)   # e.g. CW54 does not exist
+            if not (2000 <= year <= 2100):
+                raise ValueError("year")   # "26" would mean year 26
         except Exception:
             messagebox.showerror("Input error", "Please set a valid Year and CW first.")
             return
@@ -4588,8 +4603,10 @@ class App:
         # Acquire lock. show_lock_error exits on "Exit"; after "Force Unlock"
         # we must go on and load THIS folder's data (returning here kept the
         # previous folder's table, which the next save wrote into this folder)
-        if getattr(sys, "frozen", False) and not acquire_lock():
-            show_lock_error(self.root, read_lock_info())
+        if getattr(sys, "frozen", False):
+            if not acquire_lock():
+                show_lock_error(self.root, read_lock_info())
+            self._lock_regained()
 
         # Load data from share (same as startup)
         self.edit_index = None
@@ -4743,9 +4760,12 @@ class App:
 
     def show_stats(self) -> None:
         try:
-            y, m = map(int, self.month_var.get().split("-"))
+            y, m = map(int, self.month_var.get().strip().split("-"))
+            if not (2000 <= y <= 2100):
+                raise ValueError("year")
+            date(y, m, 1)   # month 1..12
         except Exception:
-            messagebox.showerror("Input error", "Month must be YYYY-MM."); return
+            messagebox.showerror("Input error", "Month must be YYYY-MM (e.g. 2026-09)."); return
         all_data = merge_week(load_monthly_data_from_weekly_reports(y, m),
                               self._table_entries_in_month(y, m), self._loaded_week_keys)
         if skipped_archives:
@@ -4775,6 +4795,8 @@ class App:
         try:
             year = int(self.week_year.get())
             cw   = int(self.cw_var.get())
+            if not (2000 <= year <= 2100):
+                raise ValueError("Year must have 4 digits (e.g. 2026).")
             start, end = cw_range(year, cw)
             # Archive the table first (each week to its own file) ...
             groups: dict[tuple, list] = {}
@@ -4856,9 +4878,12 @@ class App:
         if not self.template_path:
             messagebox.showerror("Missing template", "Select the Word template first."); return
         try:
-            y, m = map(int, self.month_var.get().split("-"))
+            y, m = map(int, self.month_var.get().strip().split("-"))
+            if not (2000 <= y <= 2100):
+                raise ValueError("year")
+            date(y, m, 1)   # month 1..12
         except Exception:
-            messagebox.showerror("Input error", "Month must be YYYY-MM."); return
+            messagebox.showerror("Input error", "Month must be YYYY-MM (e.g. 2026-09)."); return
         default = f"monthly_activity_report_{y}_{m:02d}.docx"
         # Default save dir: OneDrive monthly_reports or io_dir/monthly_reports
         _candidates_s = [
