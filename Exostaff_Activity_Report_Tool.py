@@ -962,7 +962,7 @@ def activity_key(a: dict) -> tuple:
         str(a.get("entry_type", "")),
         str(a.get("task_no", "")),
         str(a.get("task_title", "")),
-        str(a.get("effort", "")),
+        format_effort(a.get("effort", 0)),   # "1" == "1.0"
         str(a.get("description", "")).strip(),
     )
 
@@ -998,6 +998,8 @@ def normalise_activity(a: dict) -> dict:
             item["effort"] = float(item["effort"].replace(",", "."))
         except ValueError:
             pass
+    elif isinstance(item["effort"], int) and not isinstance(item["effort"], bool):
+        item["effort"] = float(item["effort"])   # 1 and 1.0 must compare equal
     if "entry_type" not in item:
         item["entry_type"] = item.get("type", "Activity")
     # Normalise entry_type — case-insensitive match against known types
@@ -1500,10 +1502,35 @@ def replace_text_keep_simple(paragraph, replacements: dict) -> None:
 # Word month/date patching
 # ---------------------------------------------------------------------------
 
+def _template_month(docx_path: Path) -> tuple[int, int] | None:
+    """Month the template was made for, from "Monthly activity report for <Month> <Year>".
+    Tags are stripped first, so text split across Word runs is still found."""
+    import re
+    with zipfile.ZipFile(docx_path) as z:
+        for name in z.namelist():
+            if not (name.startswith("word/") and name.endswith(".xml")):
+                continue
+            text = re.sub(r"<[^>]+>", "", z.read(name).decode("utf-8", "ignore"))
+            m = re.search(r"Monthly activity report for ([A-Za-z]+) (\d{4})", text)
+            if m:
+                try:
+                    return int(m.group(2)), datetime.strptime(m.group(1), "%B").month
+                except ValueError:
+                    continue
+    return None
+
+
 def patch_month_and_date_in_docx_file(docx_path, year: int, month: int) -> None:
     docx_path = Path(docx_path)
     repl_map  = build_replacements(year, month)
     replacements = {old: repl_map[key] for old, key in TEMPLATE_REPLACEMENTS}
+    # The template may come from any month (e.g. a previous report reused as
+    # template): replace THAT month's texts too, not only the April ones.
+    tpl_month = _template_month(docx_path)
+    if tpl_month and tpl_month != (year, month):
+        old_map = build_replacements(*tpl_month)
+        for key in ("title", "for_month", "ref", "month_full", "month_short", "month_end_date"):
+            replacements.setdefault(old_map[key], repl_map[key])
     new_ref   = repl_map["ref"]
     new_title = repl_map["title"]
     month_end = last_day_of_month(year, month)
@@ -1603,6 +1630,12 @@ def initials_for_user(name: str) -> str:
     if len(parts) >= 2:
         return (parts[0][:2] + parts[-1][:1]).title()
     return name[:3]
+
+def configured_groups() -> list[str]:
+    """Weekly summary sections: the WPs of tasks.txt, or its projects if it has no WPs."""
+    wps = {wp for (_, wp) in _project_map if wp}
+    return sorted(wps) if wps else sorted(set(_project_map.values()))
+
 
 def entry_wp(a: dict) -> str:
     """WP of an entry. Entries created before the WP column existed, or
@@ -1744,9 +1777,10 @@ def generate_weekly_text(
         lines.append("")
     lines.append("Current Week")
     lines.append("")
-    # Use WP keys from data, sorted (WP first, then project names)
-    all_keys = sorted(achievements.keys(),
-                      key=lambda k: (0 if k.upper().startswith("WP") or k.upper()=="SLM" else 1, k))
+    # Every configured group is listed (an empty WP says "No activities this
+    # week" instead of disappearing), plus any group found in the data.
+    order = lambda k: (0 if k.upper().startswith("WP") else 1 if k.upper() == "SLM" else 2, k)
+    all_keys = sorted(set(configured_groups()) | set(achievements), key=order)
     if not all_keys:
         all_keys = ["EPS-Sterna", "EPS-Aeolus", "Common"]
     for key in all_keys:
@@ -1754,10 +1788,7 @@ def generate_weekly_text(
     lines.append("")
     lines.append("Next week")
     lines.append("")
-    next_keys = sorted(next_steps.keys(),
-                       key=lambda k: (0 if k.upper().startswith("WP") or k.upper()=="SLM" else 1, k))
-    if not next_keys:
-        next_keys = all_keys
+    next_keys = sorted(set(configured_groups()) | set(next_steps), key=order) or all_keys
     for key in next_keys:
         add_section(lines, key, next_steps.get(key, []), "To be defined.")
     return "\n".join(lines).strip()
