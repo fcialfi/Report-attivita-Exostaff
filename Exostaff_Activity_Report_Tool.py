@@ -1038,9 +1038,18 @@ def normalise_activity(a: dict) -> dict:
 def normalise_data(data: list) -> list:
     return [normalise_activity(a) for a in data]
 
+# Set when another user forced the lock away from us: from then on nothing
+# is written to the shared folder (viewing and reports still work).
+read_only: bool = False
+READ_ONLY_MSG = ("The tool is READ-ONLY: another user has taken over the lock.\n"
+                 "Close and reopen it when they are done.")
+
+
 def atomic_write_json(path: Path, obj) -> None:
     """Write JSON via temp file + rename, so a network drop or crash mid-write
     never leaves a truncated file on the share."""
+    if read_only:
+        raise PermissionError(READ_ONLY_MSG)
     text = json.dumps(obj, indent=2, ensure_ascii=False)
     tmp  = path.with_name(path.name + ".tmp")
     try:
@@ -2594,6 +2603,9 @@ class NextWeekEditor(_FittedToplevel):
         return plan
 
     def _save(self):
+        if read_only:
+            messagebox.showwarning("Read-only", READ_ONLY_MSG, parent=self)
+            return
         plan = self._collect()
         save_next_week_plan(plan, self._target)
         messagebox.showinfo("Saved", f"Plan for CW{self._target[1]:02d}/{self._target[0]} saved.",
@@ -3275,18 +3287,32 @@ class App:
     def _lock_heartbeat(self) -> None:
         """Keep our lock fresh so other PCs don't treat it as orphaned."""
         if not refresh_lock():
+            global read_only
             log.warning("Lock taken over by %s", read_lock_info())
+            read_only = True   # never overwrite the other user's work
+            self.root.title(f"{APP_TITLE}  —  READ-ONLY")
             messagebox.showwarning(
                 "Lock taken over",
                 f"Another user has forced the unlock:\n{read_lock_info()}\n\n"
-                "Changes saved from now on may overwrite theirs. "
-                "Please coordinate and close the application.",
+                "The tool is now READ-ONLY so that it cannot overwrite their work: "
+                "you can still view data and generate reports.\n\n"
+                "Changes made since the last save are kept in this window only. "
+                "Close and reopen the tool when they are done.",
             )
             return   # stop heartbeat — lock is no longer ours
         self.root.after(LOCK_HEARTBEAT_MS, self._lock_heartbeat)
 
+    def _writable(self) -> bool:
+        """False (with a message) when the tool is read-only."""
+        if read_only:
+            messagebox.showwarning("Read-only", READ_ONLY_MSG)
+            return False
+        return True
+
     def _persist(self) -> None:
         """Write the table and the list of loaded entries to the share."""
+        if read_only:
+            return   # viewing (e.g. Load week) still works, in memory only
         write_json(self.data)
         save_table_state(self._loaded_week_keys)
 
@@ -3302,6 +3328,8 @@ class App:
             self._undo_stack.pop(0)
 
     def undo(self) -> None:
+        if not self._writable():
+            return
         if not self._undo_stack:
             self._status("Nothing to undo.")
             return
@@ -4050,6 +4078,8 @@ class App:
     # -----------------------------------------------------------------------
 
     def save_activity(self) -> None:
+        if not self._writable():
+            return
         if not require_io_dir():
             return
         try:
@@ -4261,7 +4291,7 @@ class App:
 
     def delete_selected(self) -> None:
         idx = self.selected_index()
-        if idx is None:
+        if idx is None or not self._writable():
             return
         if messagebox.askyesno("Delete", "Delete selected entry?"):
             self._push_undo("delete entry")
@@ -4285,7 +4315,7 @@ class App:
     # -----------------------------------------------------------------------
 
     def reset_data(self) -> None:
-        if not require_io_dir():
+        if not require_io_dir() or not self._writable():
             return
         if not messagebox.askyesno(
             "Reset",
@@ -4459,6 +4489,8 @@ class App:
             messagebox.showerror("Load error", str(e))
 
     def save_current_week_button(self) -> None:
+        if not self._writable():
+            return
         try:
             # Group table entries by calendar week
             groups: dict[tuple, list] = {}
@@ -4553,10 +4585,11 @@ class App:
         reload_holidays()
         self._update_combos()
 
-        # Acquire lock
+        # Acquire lock. show_lock_error exits on "Exit"; after "Force Unlock"
+        # we must go on and load THIS folder's data (returning here kept the
+        # previous folder's table, which the next save wrote into this folder)
         if getattr(sys, "frozen", False) and not acquire_lock():
             show_lock_error(self.root, read_lock_info())
-            return
 
         # Load data from share (same as startup)
         self.edit_index = None
@@ -4648,6 +4681,8 @@ class App:
             messagebox.showerror("Export error", str(e))
 
     def import_table(self) -> None:
+        if not self._writable():
+            return
         path = filedialog.askopenfilename(
             title="Import from another user",
             filetypes=[("Activity table", "*.csv *.json"), ("CSV files", "*.csv"), ("JSON files", "*.json")],
@@ -4750,7 +4785,7 @@ class App:
                 except Exception:
                     pass
             saved_file = None
-            for (gy, gcw), gentries in groups.items():
+            for (gy, gcw), gentries in (groups.items() if not read_only else []):
                 saved_file, _ = write_week_archive(gy, gcw, gentries, self._loaded_week_keys)
             # Archived entries count as loaded, so later deletions reach the archive
             self._loaded_week_keys |= {_stable_key_fn(a) for a in self.data}
@@ -5267,7 +5302,10 @@ has not been refreshed for 15 minutes (left after a crash) is
 cleared automatically.
 
 Use "🔓 Force Unlock" only if you are certain the other user
-is no longer running the tool.
+is no longer running the tool. If they still are, their tool
+detects it within 5 minutes and switches to READ-ONLY: they can
+still view data and generate reports, but nothing they do is
+written to the shared folder.
 
 ──────────────────────────────────────────────────────────────
 9. DATA FILES & BACKUPS
@@ -5356,6 +5394,9 @@ will show the new version number on next launch.
         btn_frame.pack(fill="x", pady=6)
 
         def save_and_reload():
+            if read_only:
+                messagebox.showwarning("Read-only", READ_ONLY_MSG, parent=win)
+                return
             try:
                 filepath.write_text(txt.get("1.0", "end-1c"), encoding="utf-8")   # Tk adds a trailing newline
                 self.users, self.tasks = reload_config()
