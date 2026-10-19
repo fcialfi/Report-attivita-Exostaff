@@ -26,6 +26,7 @@ import os
 import sys
 import signal
 import socket
+import time
 import logging
 import traceback
 from collections import defaultdict
@@ -232,10 +233,14 @@ def get_latest_exe_path() -> tuple[Path | None, str]:
         return None, "Release folder not found (VERSION.txt missing)."
     loc = d / "EXE_LOCATION.txt"
     try:
-        name = Path(loc.read_text(encoding="utf-8").strip().replace("\\", "/")).name
+        # written by build.bat in the console code page: only the (ASCII)
+        # file name is used, so undecodable folder names don't matter
+        text = loc.read_bytes().decode("utf-8", errors="replace")
+        name = Path(text.strip().replace("\\", "/")).name
     except OSError:
         return None, f"EXE_LOCATION.txt not found in:\n{d}"
-    exe = d / name
+    # The exe may live in the exe folder while VERSION.txt is in the data folder
+    exe = next((c / name for c in [d] + _release_dirs() if (c / name).is_file()), d / name)
     if not exe.is_file():
         return None, (f"{name} is not (yet) available in:\n{d}\n\n"
                       "If the folder is synced by OneDrive, the new version may still "
@@ -727,9 +732,13 @@ def _lock_is_stale(info: dict) -> bool:
     pid = info.get("pid")
     if info.get("host") == _HOST and pid:
         return not _pid_is_running(int(pid))
-    ts = info.get("heartbeat") or info.get("since")
     try:
-        age = (datetime.now() - datetime.strptime(ts, _TS_FMT)).total_seconds()
+        if isinstance(info.get("heartbeat_epoch"), (int, float)):
+            # epoch seconds: not shifted by daylight-saving changes
+            age = time.time() - info["heartbeat_epoch"]
+        else:   # lock written by an older version: local time
+            ts = info.get("heartbeat") or info.get("since")
+            age = (datetime.now() - datetime.strptime(ts, _TS_FMT)).total_seconds()
     except Exception:
         return True   # malformed lock
     return age > LOCK_STALE_SECONDS
@@ -743,6 +752,7 @@ def _write_lock(since: str | None = None) -> None:
         "pid":       os.getpid(),
         "since":     since or now,
         "heartbeat": now,
+        "heartbeat_epoch": time.time(),
     }
     lock_file().write_text(json.dumps(info), encoding="utf-8")
 
@@ -995,10 +1005,10 @@ def normalise_activity(a: dict) -> dict:
             item[f] = clean_text(item[f])
     if item.get("entry_type") is None:
         item.pop("entry_type", None)
-    if item.get("effort") is None:
-        item["effort"] = 0
     if "effort" not in item:
-        item["effort"] = 1
+        item["effort"] = 1      # old files without effort: one day
+    elif item["effort"] is None:
+        item["effort"] = 0
     # Same formats everywhere: ISO date and numeric effort (files edited in
     # Excel come back as "01/09/2026" and "0,5")
     try:
@@ -2135,6 +2145,8 @@ def export_to_xlsx(data: list, out_path: str) -> None:
         ]
         for col_idx, val in enumerate(values, 1):
             cell = ws.cell(row=row_idx, column=col_idx, value=val)
+            if isinstance(val, str) and val.startswith("="):
+                cell.data_type = "s"   # text such as "=> follow-up", not a formula
             cell.border = border
             cell.fill   = fill
             cell.font   = Font(name="Calibri", size=10)
@@ -2183,8 +2195,9 @@ def import_activity_table(path: str | Path) -> tuple[list, list[str]]:
         return _validate_imported(normalise_data(json.loads(path.read_text(encoding="utf-8"))))
     rows: list = []
     with open(path, "r", newline="", encoding="utf-8-sig") as f:
-        sample = f.read(4096); f.seek(0)
-        delimiter = ";" if sample.count(";") >= sample.count(",") else ","
+        # decide on the header line only: descriptions are full of commas
+        header = f.readline(); f.seek(0)
+        delimiter = ";" if header.count(";") >= header.count(",") else ","
         reader = csv.DictReader(f, delimiter=delimiter)
         for row in reader:
             if not row:
@@ -3307,8 +3320,20 @@ class App:
 
     def _lock_heartbeat(self) -> None:
         """Keep our lock fresh so other PCs don't treat it as orphaned."""
+        if self._lock_still_ours():
+            self.root.after(LOCK_HEARTBEAT_MS, self._lock_heartbeat)
+        else:
+            self._heartbeat_on = False   # _lock_regained restarts it
+
+    def _lock_still_ours(self) -> bool:
+        """Refresh the lock; if another PC took it over (Force Unlock), switch
+        to read-only at once instead of at the next heartbeat."""
+        global read_only
+        if read_only:
+            return False
+        if not getattr(sys, "frozen", False):
+            return True   # the lock is only used by the packaged exe
         if not refresh_lock():
-            global read_only
             log.warning("Lock taken over by %s", read_lock_info())
             read_only = True   # never overwrite the other user's work
             self.root.title(f"{APP_TITLE}  —  READ-ONLY")
@@ -3320,9 +3345,8 @@ class App:
                 "Changes made since the last save are kept in this window only. "
                 "Close and reopen the tool when they are done.",
             )
-            self._heartbeat_on = False
-            return   # stop heartbeat — lock is no longer ours
-        self.root.after(LOCK_HEARTBEAT_MS, self._lock_heartbeat)
+            return False   # lock is no longer ours
+        return True
 
     def _lock_regained(self) -> None:
         """We hold the lock again (e.g. folder re-selected after a takeover):
@@ -3344,7 +3368,7 @@ class App:
 
     def _persist(self) -> None:
         """Write the table and the list of loaded entries to the share."""
-        if read_only:
+        if read_only or not self._lock_still_ours():
             return   # viewing (e.g. Load week) still works, in memory only
         write_json(self.data)
         save_table_state(self._loaded_week_keys)
@@ -3377,7 +3401,7 @@ class App:
             self._working_week     = entry[2]
             self._loaded_week_keys = entry[3]
         self._persist()
-        self._clear_table_dirty()
+        self._table_dirty_after_load()   # the restored table may hold unsaved entries
         self.refresh()
         self._status(f"Undone: {desc}")
 
@@ -4021,8 +4045,12 @@ class App:
         wps = self._get_wps()
         self.wp_cb["values"] = wps
         if keep and self.task_var.get() and (self.wp_var.get() in wps or not wps):
+            current = self.task_var.get()
             self._on_wp_changed()          # refreshes the list, keeps a valid task
-            if self.edit_index is not None and self.edit_index < len(self.data):
+            # The form's task vanished (renamed in tasks.txt): fall back to the
+            # edited entry's own task, never to the first one of the list
+            if (current not in self.task_cb["values"] and self.edit_index is not None
+                    and self.edit_index < len(self.data)):
                 self._update_wp_and_task_from_entry(self.data[self.edit_index])
             return
         if wps:
@@ -4531,7 +4559,7 @@ class App:
             messagebox.showerror("Load error", str(e))
 
     def save_current_week_button(self) -> None:
-        if not self._writable():
+        if not self._writable() or not self._lock_still_ours():
             return
         try:
             # Group table entries by calendar week
@@ -4570,6 +4598,9 @@ class App:
                 saved.append(f"CW{cw:02d}/{y} ({count} entries)")
 
             auto_backup(self.data, force=True)   # always backup on Save week
+            # Snapshots predate the archive write: undoing one would leave its
+            # entries in the archive with nothing left to remove them
+            self._undo_stack.clear()
             self._clear_table_dirty()
             self._status("Saved: " + "  |  ".join(saved))
 
@@ -4747,7 +4778,6 @@ class App:
                 if key in existing_keys:
                     skipped += 1; continue
                 self.data.append(item); existing_keys.add(key); added += 1
-            self.last_io_dir = str(Path(path).parent)
             # Imported entries now count as loaded. Union, not reassignment:
             # rebuilding from self.data would forget entries deleted earlier
             # in this session, and Save week would bring them back.
@@ -4834,8 +4864,14 @@ class App:
                 except Exception:
                     pass
             saved_file = None
-            for (gy, gcw), gentries in (groups.items() if not read_only else []):
-                saved_file, _ = write_week_archive(gy, gcw, gentries, self._loaded_week_keys)
+            # also weeks whose loaded entries were all deleted from the table
+            weeks = set(groups) | {w for w in map(_week_of_key, self._loaded_week_keys) if w}
+            writable = not read_only and self._lock_still_ours()
+            for gy, gcw in (sorted(weeks) if writable else []):
+                saved_file, _ = write_week_archive(gy, gcw, groups.get((gy, gcw), []),
+                                                   self._loaded_week_keys)
+            if writable and weeks:
+                self._undo_stack.clear()   # see save_current_week_button
             # Archived entries count as loaded, so later deletions reach the archive
             self._loaded_week_keys |= {_stable_key_fn(a) for a in self.data}
             self._persist()

@@ -102,6 +102,13 @@ echo  [OK] VERSION.txt updated.
 
 echo %EXE_SHARE%\%APP_NAME%_%NEW_VERSION%.exe> "%DATA_SHARE%\EXE_LOCATION.txt"
 echo  [OK] EXE_LOCATION.txt updated.
+:: The tool looks for VERSION.txt in the exe folder first (RELEASE_DIR):
+:: publish it there too when the exe and data folders differ
+if /i not "%EXE_SHARE%"=="%DATA_SHARE%" (
+    copy /y "%DIST_DIR%\VERSION.txt" "%EXE_SHARE%\VERSION.txt" >nul
+    copy /y "%DATA_SHARE%\EXE_LOCATION.txt" "%EXE_SHARE%\EXE_LOCATION.txt" >nul
+    echo  [OK] VERSION.txt and EXE_LOCATION.txt also in the exe folder.
+)
 
 set TEMPLATE=EPS-Sterna and EPS-Aeolus System Engineering Service Template.docx
 set TEMPLATE_SRC=
