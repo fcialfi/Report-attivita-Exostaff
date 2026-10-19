@@ -3984,18 +3984,24 @@ class App:
             self.task_var.set("")
 
     def _update_wp_and_task_from_entry(self, a: dict) -> None:
-        """Restore WP and task dropdowns from a loaded entry."""
-        wp = a.get("task_wp", "")
-        if wp and hasattr(self, "wp_var"):
+        """Restore WP and task dropdowns from a loaded entry. The entry's task
+        must survive even if its title changed in tasks.txt since it was saved —
+        otherwise Save would silently move it to whatever task is selected."""
+        if a.get("entry_type") != "Activity":
+            return
+        wp = entry_wp(a)
+        if hasattr(self, "wp_var") and wp != self.wp_var.get():
             self.wp_var.set(wp)
             self._on_wp_changed()
-        if a.get("entry_type") == "Activity":
-            wp_entry = a.get("task_wp", "")
-            prefix = f"{wp_entry} - " if wp_entry else ""
-            task_str = f"{a.get('task_no')} - {a.get('task_title')}"
-            # task_cb now shows "N - Title" without WP prefix
-            if task_str in self.task_cb["values"]:
-                self.task_var.set(task_str)
+        values = list(self.task_cb["values"])
+        task_str = f"{a.get('task_no')} - {a.get('task_title')}"
+        if task_str not in values:
+            # Title changed in tasks.txt: same task number in this WP
+            same_no = [v for v in values if v.split(" - ", 1)[0].strip() == str(a.get("task_no"))]
+            if same_no:
+                task_str = same_no[0]
+            # else: keep the entry's own task (not in the list any more)
+        self.task_var.set(task_str)
 
     def parse_task(self) -> tuple[int, str, str]:
         """Parse task_var and wp_var. Returns (task_no, task_title, task_wp)."""
@@ -5351,7 +5357,7 @@ will show the new version number on next launch.
 
         def save_and_reload():
             try:
-                filepath.write_text(txt.get("1.0", "end"), encoding="utf-8")
+                filepath.write_text(txt.get("1.0", "end-1c"), encoding="utf-8")   # Tk adds a trailing newline
                 self.users, self.tasks = reload_config()
                 reload_holidays()
                 self._update_combos()
