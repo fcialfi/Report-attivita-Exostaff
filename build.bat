@@ -75,7 +75,7 @@ if exist %APP_NAME%.spec del %APP_NAME%.spec
 :: ── Build ───────────────────────────────────────────────────────────────
 echo.
 echo  [INFO] Building exe...
-python -m PyInstaller --onefile --windowed --name "%APP_NAME%" --distpath "%DIST_DIR%" --workpath "%BUILD_DIR%" --clean %SCRIPT% >> %LOG_FILE% 2>&1
+python -m PyInstaller --onefile --windowed --name "%APP_NAME%" --icon "assets\exostaff_icon.ico" --add-data "assets;assets" --distpath "%DIST_DIR%" --workpath "%BUILD_DIR%" --clean %SCRIPT% >> %LOG_FILE% 2>&1
 if errorlevel 1 ( echo [ERROR] Build FAILED. See %LOG_FILE%. & pause & exit /b 1 )
 echo  [OK] Build successful.
 

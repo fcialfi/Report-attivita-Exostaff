@@ -517,14 +517,16 @@ _project_map:    dict[tuple, str]       = {}
 _initials_map:   dict[tuple, list[str]] = {}
 _wp_map:         dict[tuple, str]       = {}
 _users_initials: dict[str, str]         = {}   # user full name -> initials
+_task_titles:    dict[tuple, str]       = {}   # (task_no, wp) -> title
 
 
 def reload_config() -> tuple[list[str], list[tuple]]:
     """Reload users and tasks from config files. Updates global maps."""
-    global _project_map, _initials_map, _wp_map, _users_initials
+    global _project_map, _initials_map, _wp_map, _users_initials, _task_titles
     create_default_config()
     users = load_users_from_config()
     tasks, _project_map, _initials_map, _wp_map = load_tasks_from_config()
+    _task_titles = {(n, wp): t for n, t, wp in tasks}
     # Build user->initials map from users.txt names
     # Format: first 2 chars of first name + first char of last name, capitalised
     _users_initials = {}
@@ -796,6 +798,34 @@ def load_app_state() -> tuple[Path | None, list[str], list[tuple], str, str]:
 # ---------------------------------------------------------------------------
 # Dynamic template discovery
 # ---------------------------------------------------------------------------
+
+# ---------------------------------------------------------------------------
+# Exostaff logo / icon (assets/ next to the script, or bundled in the exe)
+# ---------------------------------------------------------------------------
+
+_ASSETS_DIR = Path(getattr(sys, "_MEIPASS", Path(__file__).parent)) / "assets"
+LOGO_HEADER_FILE = "exostaff_logo_header.png"   # 44 px high, window header
+LOGO_SPLASH_FILE = "exostaff_logo_splash.png"   # 60 px high, startup splash
+ICON_FILE        = "exostaff_icon.ico"
+ICON_PNG_FILE    = "exostaff_icon_64.png"
+
+
+def _asset_path(name: str) -> Path | None:
+    path = _ASSETS_DIR / name
+    return path if path.is_file() else None
+
+
+def _load_image(name: str, master=None):
+    """An assets/ PNG as a Tk image, or None when missing/unreadable.
+    The caller must keep a reference to it, or Tk discards the image."""
+    path = _asset_path(name)
+    if path is None:
+        return None
+    try:
+        return tk.PhotoImage(file=str(path), master=master)
+    except tk.TclError:
+        return None
+
 
 def _template_label(path) -> str:
     """Return header label for the loaded template."""
@@ -1446,6 +1476,26 @@ def initials_for_user(name: str) -> str:
         return (parts[0][:2] + parts[-1][:1]).title()
     return name[:3]
 
+def entry_wp(a: dict) -> str:
+    """WP of an entry. Entries created before the WP column existed, or
+    imported from CSV, have no task_wp: recover it from config/tasks.txt
+    (exact title first, then task number if it is unique across WPs)."""
+    wp = a.get("task_wp", "") or ""
+    if wp or a.get("entry_type", "Activity") != "Activity":
+        return wp
+    title = _norm_title(a.get("task_title", ""))
+    if title:
+        by_title = {k[1] for k in _project_map if _norm_title(_task_titles.get(k, "")) == title}
+        if len(by_title) == 1:
+            return by_title.pop()
+    try:
+        n = int(a.get("task_no", 0) or 0)
+    except Exception:
+        return ""
+    by_no = {k[1] for k in _project_map if k[0] == n}
+    return by_no.pop() if len(by_no) == 1 else ""
+
+
 def project_for_task(task_no, wp: str = "") -> str:
     try:
         n = int(task_no)
@@ -1470,10 +1520,11 @@ def _weekly_items_for_period(data: list, start: date, end: date) -> dict[str, li
             continue
         if not (start <= d <= end):
             continue
-        desc = _clean_bullet(a.get("description", ""))
+        # No description: fall back to the task title rather than dropping the entry
+        desc = _clean_bullet(a.get("description", "") or a.get("task_title", ""))
         if not desc:
             continue
-        wp      = a.get("task_wp", "")
+        wp      = entry_wp(a)
         project = project_for_task(int(a.get("task_no", 0) or 0), wp)
         # Group key: WP if present, else project
         group_key = wp if wp else project
@@ -1895,6 +1946,7 @@ def import_activity_table(path: str | Path) -> list:
                 "entry_type":  row.get("entry_type", row.get("type", "Activity")),
                 "task_no":     row.get("task_no", 0) or 0,
                 "task_title":  row.get("task_title", ""),
+                "task_wp":     (row.get("task_wp") or "").strip(),
                 "effort":      row.get("effort", 0) or 0,
                 "description": row.get("description", row.get("desc", "")),
             }
@@ -2071,7 +2123,7 @@ class SplashScreen:
         self._win = tk.Toplevel(root)
         self._win.overrideredirect(True)
         self._win.attributes("-topmost", True)
-        w, h = 480, 220
+        w, h = 480, 260
         sw, sh = root.winfo_screenwidth(), root.winfo_screenheight()
         self._win.geometry(f"{w}x{h}+{(sw-w)//2}+{(sh-h)//2}")
         self._win.configure(bg=SPLASH_BG)
@@ -2080,10 +2132,16 @@ class SplashScreen:
         tk.Frame(self._win, bg=ACCENT, height=3).pack(fill="x")
 
         # Logo area
+        logo = _load_image(LOGO_SPLASH_FILE, master=self._win)
+        if logo is not None:
+            lbl = tk.Label(self._win, image=logo, bg=SPLASH_BG, bd=0)
+            lbl.image = logo
+            lbl.pack(pady=(22, 6))
         logo_frame = tk.Frame(self._win, bg=SPLASH_BG)
-        logo_frame.pack(pady=(24, 0))
-        tk.Label(logo_frame, text="◈", font=("Segoe UI", 22),
-                 bg=SPLASH_BG, fg=ACCENT).pack(side="left", padx=(0, 10))
+        logo_frame.pack(pady=(0 if logo is not None else 24, 0))
+        if logo is None:
+            tk.Label(logo_frame, text="◈", font=("Segoe UI", 22),
+                     bg=SPLASH_BG, fg=ACCENT).pack(side="left", padx=(0, 10))
         tk.Label(logo_frame, text=APP_TITLE,
                  font=("Segoe UI Semibold", 16, "bold"),
                  bg=SPLASH_BG, fg=SPLASH_FG).pack(side="left")
@@ -2176,7 +2234,7 @@ class _FittedToplevel(tk.Toplevel):
 # ---------------------------------------------------------------------------
 
 class NextWeekEditor(_FittedToplevel):
-    PROJECTS = ["EPS-Sterna", "EPS-Aeolus", "Common"]
+    DEFAULT_GROUPS = ["EPS-Sterna", "EPS-Aeolus", "Common"]
 
     def __init__(self, parent, tasks: list[tuple]):
         super().__init__(parent)
@@ -2185,6 +2243,11 @@ class NextWeekEditor(_FittedToplevel):
         self._fit_window(780, 560)
         self.tasks  = tasks
         self._plan  = load_next_week_plan()
+        # Same grouping as the weekly summary: by WP when tasks.txt has WPs
+        wps = sorted({wp for _, _, wp in tasks if wp},
+                     key=lambda w: (0 if w.upper().startswith("WP") else 1, w))
+        groups = wps or self.DEFAULT_GROUPS
+        self.PROJECTS = groups + [k for k in self._plan if k not in groups]
         self._texts: dict[str, tk.Text] = {}
         self._build()
         self.grab_set()
@@ -2423,7 +2486,7 @@ class StatsWindow(_FittedToplevel):
         f2 = ttk.Frame(nb); nb.add(f2, text="By Task")
         by_task: dict[tuple, float] = defaultdict(float)
         for a in filtered:
-            wp    = a.get("task_wp", "")
+            wp    = entry_wp(a)
             key   = (wp, int(a.get("task_no", 0) or 0), a.get("task_title", ""))
             by_task[key] += float(a.get("effort", 0) or 0)
         self._make_table(
@@ -2438,7 +2501,7 @@ class StatsWindow(_FittedToplevel):
         for a in filtered:
             by_proj[project_for_task(
                 a.get("task_no", 0),
-                a.get("task_wp", "")
+                entry_wp(a)
             )] += float(a.get("effort", 0) or 0)
         self._make_table(f3, ["Project", "Person-Days"],
                          [(p, f"{v:g}") for p, v in sorted(by_proj.items())],
@@ -2448,7 +2511,7 @@ class StatsWindow(_FittedToplevel):
         f5 = ttk.Frame(nb); nb.add(f5, text="By WP")
         by_wp: dict[str, float] = defaultdict(float)
         for a in filtered:
-            wp = a.get("task_wp", "") or project_for_task(a.get("task_no", 0), "")
+            wp = entry_wp(a) or project_for_task(a.get("task_no", 0), "")
             by_wp[wp] += float(a.get("effort", 0) or 0)
         self._make_table(f5, ["WP", "Person-Days"],
                          [(w, f"{v:g}") for w, v in sorted(by_wp.items())],
@@ -2609,6 +2672,17 @@ class App:
         root.title(APP_TITLE)
         root.minsize(1100, 600)
         root.withdraw()
+
+        icon_path = _asset_path(ICON_FILE)
+        if icon_path and sys.platform == "win32":
+            try:
+                root.iconbitmap(default=str(icon_path))
+            except tk.TclError:
+                pass
+        icon_image = _load_image(ICON_PNG_FILE, master=root)
+        if icon_image is not None:
+            self._icon_image = icon_image
+            root.iconphoto(True, icon_image)
 
         # ── Fit window inside usable screen area (taskbar-aware) ─────────────
         # Geometry is set AFTER widgets are built — see _fit_to_screen() call below
@@ -3068,12 +3142,19 @@ class App:
 
     def build_ui(self) -> None:
         # ── Header banner ────────────────────────────────────────────────────
-        header = tk.Frame(self.root, bg=BG_HEADER, height=46)
+        header = tk.Frame(self.root, bg=BG_HEADER, height=52)
         header.pack(fill="x")
         header.pack_propagate(False)
 
-        tk.Label(header, text="◈", font=("Segoe UI", 14),
-                 bg=BG_HEADER, fg=ACCENT).pack(side="left", padx=(14, 6), pady=8)
+        logo = _load_image(LOGO_HEADER_FILE, master=header)
+        if logo is not None:
+            lbl = tk.Label(header, image=logo, bg=BG_HEADER, bd=0)
+            lbl.image = logo
+            lbl.pack(side="left", padx=(12, 12), pady=4)
+            tk.Frame(header, bg="#3a4a5a", width=1).pack(side="left", fill="y", pady=12, padx=(0, 12))
+        else:
+            tk.Label(header, text="◈", font=("Segoe UI", 14),
+                     bg=BG_HEADER, fg=ACCENT).pack(side="left", padx=(14, 6), pady=8)
         tk.Label(header, text=APP_TITLE,
                  font=("Segoe UI Semibold", 11, "bold"),
                  bg=BG_HEADER, fg="#ffffff").pack(side="left", pady=8)
@@ -4294,7 +4375,7 @@ class App:
             elif out.lower().endswith(".xlsx"):
                 export_to_xlsx(self.data, out)
             else:
-                fields = ["date", "user", "entry_type", "task_no", "task_title", "effort", "description"]
+                fields = ["date", "user", "entry_type", "task_wp", "task_no", "task_title", "effort", "description"]
                 with open(out, "w", newline="", encoding="utf-8-sig") as f:
                     writer = csv.DictWriter(f, fieldnames=fields, extrasaction="ignore", delimiter=";")
                     writer.writeheader()
@@ -4336,6 +4417,9 @@ class App:
             return
         try:
             imported = import_activity_table(path)
+            for item in imported:   # files from older versions carry no WP
+                if not item.get("task_wp"):
+                    item["task_wp"] = entry_wp(item)
             existing_keys = {activity_key(a) for a in self.data}
             added = skipped = 0
             self._push_undo("import")
