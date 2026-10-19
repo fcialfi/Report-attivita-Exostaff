@@ -20,6 +20,7 @@ Changes vs v3:
 """
 
 import json
+import math
 import csv
 import os
 import sys
@@ -1422,6 +1423,12 @@ def _effort_text(value) -> str:
         return str(value)
 
 
+def valid_effort(v: float) -> bool:
+    """A real person-day value: finite, > 0 and not absurd ("nan", "inf"
+    and "1e3" are accepted by float())."""
+    return math.isfinite(v) and 0 < v <= 100
+
+
 def format_effort(value) -> str:
     """Format effort with 2 decimal places max, no trailing zeros.
     Uses Decimal for precision to avoid float rounding artifacts.
@@ -1431,6 +1438,8 @@ def format_effort(value) -> str:
         v = float(value)
     except Exception:
         return "0"
+    if not math.isfinite(v):
+        return str(v)   # "nan"/"inf" from a damaged file: show it, don't crash
     d = Decimal(str(round(v, 10))).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
     if d == d.to_integral_value():
         return str(int(d))
@@ -2202,8 +2211,8 @@ def _validate_imported(rows: list) -> tuple[list, list[str]]:
         except ValueError:
             problems.append(f"date {a.get('date', '')!r}")
         try:
-            if float(a.get("effort", 0)) <= 0:
-                problems.append("effort must be > 0")
+            if not valid_effort(float(a.get("effort", 0))):
+                problems.append("effort must be a number > 0 and <= 100")
         except (TypeError, ValueError):
             problems.append(f"effort {a.get('effort')!r}")
         if not str(a.get("user", "")).strip():
@@ -3994,10 +4003,17 @@ class App:
         wps = sorted(seen, key=lambda w: (0 if w.upper().startswith("WP") else 1, w))
         return wps
 
-    def _populate_wp_cb(self) -> None:
-        """Populate WP combobox and set default."""
+    def _populate_wp_cb(self, keep: bool = False) -> None:
+        """Populate WP combobox and set default. keep=True (config reload):
+        keep the current WP/task if they still exist, so an entry being
+        edited is not silently moved to the first task on Save."""
         wps = self._get_wps()
         self.wp_cb["values"] = wps
+        if keep and self.task_var.get() and (self.wp_var.get() in wps or not wps):
+            self._on_wp_changed()          # refreshes the list, keeps a valid task
+            if self.edit_index is not None and self.edit_index < len(self.data):
+                self._update_wp_and_task_from_entry(self.data[self.edit_index])
+            return
         if wps:
             # Default: first non-SLM WP, or first WP
             default = next((w for w in wps if w.upper() != "SLM"), wps[0])
@@ -4102,8 +4118,8 @@ class App:
             return
         try:
             effort = float(self.effort_var.get().replace(",", "."))
-            if effort <= 0:
-                raise ValueError("effort must be > 0")
+            if not valid_effort(effort):
+                raise ValueError("effort must be a number between 0 and 100 (e.g. 0.5)")
         except Exception as e:
             messagebox.showerror("Input error", f"Invalid effort value.\n{e}")
             return
@@ -5445,7 +5461,7 @@ will show the new version number on next launch.
                     self.last_user if self.last_user in self.users else self.users[0]
                 )
         if hasattr(self, "wp_cb"):
-            self._populate_wp_cb()
+            self._populate_wp_cb(keep=True)
 
     def reload_config_from_files(self) -> None:
         """Reload users, tasks and holidays from config files and refresh UI."""
@@ -5462,7 +5478,7 @@ will show the new version number on next launch.
                     self.user_var.set(self.last_user if self.last_user in self.users else self.users[0])
             # Update WP and task comboboxes
             if hasattr(self, "wp_cb"):
-                self._populate_wp_cb()
+                self._populate_wp_cb(keep=True)
             self._status(
                 f"Config reloaded — {len(self.users)} users, "
                 f"{len(self.tasks)} tasks, {len(_holidays)} holidays"
