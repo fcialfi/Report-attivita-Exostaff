@@ -82,6 +82,10 @@ def setup_log_file() -> None:
 # ---------------------------------------------------------------------------
 APP_TITLE         = "Activity Report Tool"
 APP_VERSION       = "1.1.2"   # updated by build.bat on each release
+# Release folder (VERSION.txt, EXE_LOCATION.txt, exe) — written by build.bat.
+# "~" = the user's home, so a OneDrive folder resolves on every PC.
+RELEASE_DIR       = ""
+UPDATE_CHECK_MS   = 4 * 60 * 60 * 1000   # re-check for a new release while open
 SAVE_BACKUP_EVERY = 10
 
 # ---------------------------------------------------------------------------
@@ -166,61 +170,76 @@ def log_file() -> Path:
     return _exe_dir() / "activity_report.log"
 
 
-def version_file() -> Path:
-    """VERSION.txt lives on the share — single source of truth for current version."""
-    return (_io_root / "VERSION.txt") if _io_root else _exe_dir() / "VERSION.txt"
+def _release_dirs() -> list[Path]:
+    """Where to look for a published release: the folder baked in at build
+    time first, then the user's working folder (old behaviour)."""
+    dirs: list[Path] = []
+    if RELEASE_DIR:
+        dirs.append(Path(os.path.expanduser(RELEASE_DIR)))
+    if _io_root:
+        dirs.append(_io_root)
+    return dirs
+
+
+def release_dir() -> Path | None:
+    """First candidate folder that actually contains VERSION.txt."""
+    for d in _release_dirs():
+        try:
+            if (d / "VERSION.txt").is_file():
+                return d
+        except OSError:
+            continue
+    return None
+
+
+def _parse_version(v: str) -> tuple:
+    try:
+        return tuple(int(x) for x in v.strip().lstrip("vV").split("."))
+    except ValueError:
+        return (0,)
 
 
 def check_version() -> tuple[str, bool]:
-    """Read version from share VERSION.txt. Returns (latest_version, update_available).
+    """Read the published VERSION.txt. Returns (latest_version, update_available).
     Never writes VERSION.txt — that is the build script's job.
-    If VERSION.txt doesn't exist yet, returns (APP_VERSION, False) silently.
     """
     try:
-        vf = version_file()
-        if not vf.exists():
-            log.warning("check_version: VERSION.txt not found at %s", vf)
+        d = release_dir()
+        if d is None:
+            log.warning("check_version: VERSION.txt not found in %s", _release_dirs())
             return APP_VERSION, False
-        latest = vf.read_text(encoding="utf-8").strip()
+        latest = (d / "VERSION.txt").read_text(encoding="utf-8").strip()
         if not latest:
-            log.warning("check_version: VERSION.txt is empty at %s", vf)
+            log.warning("check_version: VERSION.txt is empty in %s", d)
             return APP_VERSION, False
-        def parse(v):
-            try: return tuple(int(x) for x in v.split("."))
-            except: return (0,)
-        update_available = parse(latest) > parse(APP_VERSION)
-        log.warning("check_version: share=%s local=%s update=%s",
-                    latest, APP_VERSION, update_available)
+        update_available = _parse_version(latest) > _parse_version(APP_VERSION)
+        log.warning("check_version: release=%s (%s) local=%s update=%s",
+                    latest, d, APP_VERSION, update_available)
         return latest, update_available
     except Exception as exc:
         log.warning("check_version failed: %s", exc)
         return APP_VERSION, False
 
 
-def write_version_to_share() -> None:
-    """Write current APP_VERSION to share VERSION.txt (called by build/deploy)."""
+def get_latest_exe_path() -> tuple[Path | None, str]:
+    """Locate the published exe. Returns (path, error message).
+    EXE_LOCATION.txt may hold an absolute path from the build PC
+    (C:\\Users\\<builder>\\...), so only its FILE NAME is trusted and it is
+    looked up next to EXE_LOCATION.txt, wherever the folder is synced."""
+    d = release_dir()
+    if d is None:
+        return None, "Release folder not found (VERSION.txt missing)."
+    loc = d / "EXE_LOCATION.txt"
     try:
-        if _io_root:
-            version_file().write_text(APP_VERSION, encoding="utf-8")
-    except Exception as exc:
-        log.warning("write_version_to_share failed: %s", exc)
-
-
-def exe_location_file() -> Path:
-    """Points to a file on the share that contains the path of the latest exe."""
-    return (_io_root / "EXE_LOCATION.txt") if _io_root else _exe_dir() / "EXE_LOCATION.txt"
-
-
-def get_latest_exe_path() -> Path | None:
-    """Read the path of the latest exe from the share."""
-    try:
-        f = exe_location_file()
-        if not f.exists():
-            return None
-        p = Path(f.read_text(encoding="utf-8").strip())
-        return p if p.exists() else None
-    except Exception:
-        return None
+        name = Path(loc.read_text(encoding="utf-8").strip().replace("\\", "/")).name
+    except OSError:
+        return None, f"EXE_LOCATION.txt not found in:\n{d}"
+    exe = d / name
+    if not exe.is_file():
+        return None, (f"{name} is not (yet) available in:\n{d}\n\n"
+                      "If the folder is synced by OneDrive, the new version may still "
+                      "be downloading — try again in a few minutes.")
+    return exe, ""
 
 
 def auto_update(on_progress=None) -> tuple[bool, str]:
@@ -235,11 +254,10 @@ def auto_update(on_progress=None) -> tuple[bool, str]:
             on_progress(msg)
 
     # Find latest exe on share
-    progress("Locating new version on share…")
-    src = get_latest_exe_path()
+    progress("Locating new version…")
+    src, err = get_latest_exe_path()
     if not src:
-        return False, ("EXE_LOCATION.txt not found or exe missing on share.\n"
-                       "Contact your administrator.")
+        return False, err
 
     # Only works as compiled exe
     if not getattr(sys, "frozen", False):
@@ -2895,6 +2913,7 @@ class App:
 
         if _running_as_exe:
             self.root.after(LOCK_HEARTBEAT_MS, self._lock_heartbeat)
+        self.root.after(UPDATE_CHECK_MS, self._periodic_update_check)
 
         if data_load_warning:
             messagebox.showwarning("Data file problem", data_load_warning)
@@ -5170,8 +5189,15 @@ will show the new version number on next launch.
                        txt.configure(state="disabled"),
                    ]).pack(pady=(0, 8))
 
+    def _periodic_update_check(self) -> None:
+        latest, available = check_version()
+        if available and latest != getattr(self, "_notified_version", None):
+            self._show_update_notice(latest, APP_VERSION)
+        self.root.after(UPDATE_CHECK_MS, self._periodic_update_check)
+
     def _show_update_notice(self, latest: str, current: str) -> None:
         """Show update dialog with auto-update button."""
+        self._notified_version = latest
         import threading
         win = tk.Toplevel(self.root)
         win.title("Update available")
@@ -5189,7 +5215,8 @@ will show the new version number on next launch.
                  text=f"Your version:   {current}\nLatest version: {latest}",
                  font=("Consolas", 10), bg=BG_PANEL, fg=FG_MAIN, justify="left").pack(pady=(0, 6))
 
-        status_var = tk.StringVar(value="Click 'Update Now' to download and restart automatically.")
+        status_var = tk.StringVar(value="Click 'Update Now' to download it. The application then "
+                                        "closes — reopen it to use the new version.")
         tk.Label(win, textvariable=status_var,
                  font=("Segoe UI", 8), bg=BG_PANEL, fg=FG_DIM,
                  wraplength=400, justify="center").pack(pady=(0, 8))
