@@ -874,8 +874,9 @@ DEFAULT_TEMPLATE = _find_default_template()
 # ---------------------------------------------------------------------------
 
 def safe_date(s: str) -> date:
-    """Parse DD/MM/YY, DD/MM/YYYY or YYYY-MM-DD."""
-    for fmt in ("%d/%m/%y", "%d/%m/%Y", "%Y-%m-%d"):
+    """Parse DD/MM/YY, DD/MM/YYYY or YYYY-MM-DD (and common Excel variants)."""
+    for fmt in ("%d/%m/%y", "%d/%m/%Y", "%Y-%m-%d", "%Y/%m/%d", "%d.%m.%Y", "%d-%m-%Y",
+                "%Y-%m-%d %H:%M:%S"):
         try:
             return datetime.strptime(s.strip(), fmt).date()
         except ValueError:
@@ -959,6 +960,17 @@ def normalise_activity(a: dict) -> dict:
         item["description"] = item.get("desc", "")
     if "effort" not in item:
         item["effort"] = 1
+    # Same formats everywhere: ISO date and numeric effort (files edited in
+    # Excel come back as "01/09/2026" and "0,5")
+    try:
+        item["date"] = safe_date(str(item.get("date", ""))).isoformat()
+    except ValueError:
+        pass   # left as is; flagged on import
+    if isinstance(item["effort"], str):
+        try:
+            item["effort"] = float(item["effort"].replace(",", "."))
+        except ValueError:
+            pass
     if "entry_type" not in item:
         item["entry_type"] = item.get("type", "Activity")
     # Normalise entry_type — case-insensitive match against known types
@@ -1015,13 +1027,58 @@ def atomic_write_json(path: Path, obj) -> None:
 def write_json(data: list) -> None:
     atomic_write_json(data_file(), normalise_data(data))
 
-def save_weekly_archive(data: list, ref_date: date | None = None) -> Path | None:
-    if ref_date is None:
-        ref_date = date.today()
-    data = normalise_data(data)
-    if not data:
+# ---------------------------------------------------------------------------
+# Table state: which entries were loaded into the table. Persisted next to
+# activities_current.json so that deletions and edits are applied to the
+# weekly archive even if the user closes without "Save week".
+# ---------------------------------------------------------------------------
+
+def table_state_file() -> Path:
+    return data_file().with_name("activities_current.state.json")
+
+
+def save_table_state(loaded_keys: set) -> None:
+    try:
+        atomic_write_json(table_state_file(),
+                          {"loaded_keys": sorted(list(k) for k in loaded_keys)})
+    except Exception as exc:
+        log.warning("save_table_state failed: %s", exc)
+
+
+def load_table_state() -> set:
+    try:
+        raw = json.loads(table_state_file().read_text(encoding="utf-8"))
+        return {tuple(str(x) for x in k) for k in raw.get("loaded_keys", [])}
+    except FileNotFoundError:
+        return set()
+    except Exception as exc:
+        log.warning("load_table_state failed: %s", exc)
+        return set()
+
+
+def _week_of_key(key: tuple) -> tuple[int, int] | None:
+    try:
+        return iso_year_week_for_date(safe_date(key[0]))
+    except (ValueError, IndexError):
         return None
-    week_file = current_week_file_for_date(ref_date)
+
+
+def merge_week(existing: list, entries: list, loaded_keys: set | frozenset = frozenset()) -> list:
+    """Archive content of one week after saving the table's entries for it:
+    - table versions replace archived entries with the same key;
+    - archived entries that were loaded into the table but are no longer
+      there were deleted (or edited into another key/date) and are dropped;
+    - everything else (e.g. other users' entries) is kept."""
+    table = {_stable_key_fn(a) for a in entries}
+    kept = [a for a in existing
+            if _stable_key_fn(a) not in table and _stable_key_fn(a) not in loaded_keys]
+    return kept + list(entries)
+
+
+def write_week_archive(year: int, cw: int, entries: list,
+                       loaded_keys: set | frozenset = frozenset()) -> tuple[Path, int]:
+    """Merge entries into week_<year>_CW<cw>.json. Returns (file, entry count)."""
+    week_file = weekly_dir() / f"week_{year}_CW{cw:02d}.json"
     existing: list = []
     if week_file.exists():
         try:
@@ -1031,53 +1088,53 @@ def save_weekly_archive(data: list, ref_date: date | None = None) -> Path | None
             log.error("Could not read existing weekly archive %s: %s", week_file, exc)
             raise RuntimeError(f"Weekly archive {week_file.name} is unreadable; "
                                f"not overwritten. Check the file.") from exc
-    # Entries passed in win over archived versions with the same stable key,
-    # otherwise an entry edited after a previous archive would be stored twice.
-    merged = merge_entries(existing, data)
+    merged = normalise_data(merge_week(existing, normalise_data(entries), loaded_keys))
     merged.sort(key=lambda a: (str(a.get("date", "")), str(a.get("user", ""))))
     atomic_write_json(week_file, merged)
-    return week_file
+    return week_file, len(merged)
+
+
+def save_weekly_archive(data: list, ref_date: date | None = None,
+                        loaded_keys: set | frozenset = frozenset()) -> Path | None:
+    if ref_date is None:
+        ref_date = date.today()
+    if not data:
+        return None
+    return write_week_archive(*iso_year_week_for_date(ref_date), data, loaded_keys)[0]
 
 def reset_if_new_week(data: list) -> tuple[list, bool, Path | None]:
     """Auto-archive past weeks. Groups by week so each lands in its own file."""
     data = normalise_data(data)
-    if not data:
-        return data, False, None
+    loaded = load_table_state()
     today = date.today()
     current_yw = iso_year_week_for_date(today)
 
     # Group all entries by calendar week
     groups: dict[tuple, list] = {}
+    undated: list = []
     for a in data:
         try:
             key = iso_year_week_for_date(safe_date(a["date"]))
             groups.setdefault(key, []).append(a)
         except Exception:
-            pass
+            undated.append(a)   # kept in the table, never silently dropped
 
-    if not groups:
-        return data, False, None
-
-    # Check if any group belongs to a past week
-    past_weeks = {k: v for k, v in groups.items() if k != current_yw}
+    # Past weeks with entries in the table, or with deletions still to apply
+    past_weeks = {k for k in groups if k != current_yw}
+    past_weeks |= {w for w in map(_week_of_key, loaded) if w and w != current_yw}
     if not past_weeks:
         return data, False, None
 
     # Only auto-archive if current week has NO entries in the file.
     # If current week already has entries, the user is working on mixed weeks
     # intentionally — do not auto-archive silently.
-    current_data = groups.get(current_yw, [])
-    if current_data:
-        # Mixed weeks but current week has entries — leave as-is, no reset
+    if groups.get(current_yw):
         return data, False, None
 
-    # Genuine week change: only past entries present — archive them
+    # Genuine week change: archive past weeks (additions, edits and deletions)
     last_saved = None
-    for (yw_y, yw_cw), entries in past_weeks.items():
-        ref = iso_week_monday(yw_y, yw_cw)
-        sf  = save_weekly_archive(entries, ref)
-        if sf:
-            last_saved = sf
+    for yw_y, yw_cw in sorted(past_weeks):
+        last_saved, _ = write_week_archive(yw_y, yw_cw, groups.get((yw_y, yw_cw), []), loaded)
 
     # Load current week from archive (may already have entries saved earlier)
     y, cw = current_yw
@@ -1091,7 +1148,9 @@ def reset_if_new_week(data: list) -> tuple[list, bool, Path | None]:
         except Exception:
             pass
 
+    current_from_archive += undated
     write_json(current_from_archive)
+    save_table_state({_stable_key_fn(a) for a in current_from_archive})
     return current_from_archive, True, last_saved
 
 # Set when the data file could not be read — shown to the user by the App
@@ -1717,6 +1776,7 @@ def generate_monthly_docx(template_path, data: list, year: int, month: int, out_
 
     activities_by_user_task: dict = defaultdict(list)
     leave_by_user: dict = defaultdict(float)
+    unmapped: list[str] = []
     for a in normalise_data(data):
         try:
             d = safe_date(a["date"])
@@ -1731,7 +1791,8 @@ def generate_monthly_docx(template_path, data: list, year: int, month: int, out_
             if task_no > 0:
                 activities_by_user_task[(a.get("user", ""), task_no, task_wp)].append(a)
             else:
-                log.warning("Skipping Activity entry with task_no=0: %s", a)
+                unmapped.append(f"{a.get('user', '')}: {a.get('date', '')} activity without task "
+                                f"({format_effort(a.get('effort', 0))} PD)")
         elif et in ("Holiday", "Sick Leave"):
             # FIX C: only count genuine leave entries (not malformed Activities)
             leave_by_user[a.get("user", "")] += float(a.get("effort", 0) or 0)
@@ -1744,7 +1805,6 @@ def generate_monthly_docx(template_path, data: list, year: int, month: int, out_
         )
 
     user_efforts: dict[str, float] = {}
-    unmapped: list[str] = []
     for user, table in user_tables:
         total_effort = 0.0
         # Detect which WP this table belongs to from header row
@@ -1958,10 +2018,11 @@ def export_to_xlsx(data: list, out_path: str) -> None:
 # Import helpers
 # ---------------------------------------------------------------------------
 
-def import_activity_table(path: str | Path) -> list:
+def import_activity_table(path: str | Path) -> tuple[list, list[str]]:
+    """Returns (valid entries, descriptions of rejected rows)."""
     path = Path(path)
     if path.suffix.lower() == ".json":
-        return normalise_data(json.loads(path.read_text(encoding="utf-8")))
+        return _validate_imported(normalise_data(json.loads(path.read_text(encoding="utf-8"))))
     rows: list = []
     with open(path, "r", newline="", encoding="utf-8-sig") as f:
         sample = f.read(4096); f.seek(0)
@@ -1989,7 +2050,31 @@ def import_activity_table(path: str | Path) -> list:
             except Exception:
                 item["effort"] = 0
             rows.append(item)
-    return normalise_data(rows)
+    return _validate_imported(normalise_data(rows))
+
+
+def _validate_imported(rows: list) -> tuple[list, list[str]]:
+    """Reject rows the rest of the tool cannot handle (they would crash
+    totals or be dropped silently at the next week change)."""
+    valid, rejected = [], []
+    for i, a in enumerate(rows, 1):
+        problems = []
+        try:
+            safe_date(str(a.get("date", "")))
+        except ValueError:
+            problems.append(f"date {a.get('date', '')!r}")
+        try:
+            if float(a.get("effort", 0)) <= 0:
+                problems.append("effort must be > 0")
+        except (TypeError, ValueError):
+            problems.append(f"effort {a.get('effort')!r}")
+        if not str(a.get("user", "")).strip():
+            problems.append("no user")
+        if problems:
+            rejected.append(f"row {i}: " + ", ".join(problems))
+        else:
+            valid.append(a)
+    return valid, rejected
 
 # ---------------------------------------------------------------------------
 # Date picker popup
@@ -2411,10 +2496,15 @@ class StatsWindow(_FittedToplevel):
 
         filtered = [a for a in normalise_data(data) if _valid_activity(a)]
 
+        def _in_month(a):
+            try:
+                return month_start <= safe_date(a.get("date", "")) <= month_end
+            except ValueError:
+                return False
+
         leave_entries = [
             a for a in normalise_data(data)
-            if a.get("entry_type") in ("Holiday", "Sick Leave")
-            and month_start <= safe_date(a.get("date", "1900-01-01")) <= month_end
+            if a.get("entry_type") in ("Holiday", "Sick Leave") and _in_month(a)
         ]
 
         # ── Working days summary panel ────────────────────────────────────────
@@ -2881,6 +2971,10 @@ class App:
                 # Read data from share (AFTER io_dir is set)
                 splash.set_status("Reading activity data…")
                 self.data, was_reset, saved_file = read_json()
+                # Entries loaded in the previous session (incl. deleted ones
+                # whose deletion still has to reach the archive)
+                self._loaded_week_keys = (load_table_state()
+                                          | {_stable_key_fn(a) for a in self.data})
                 # Set working week
                 if self.data:
                     try:
@@ -2892,7 +2986,6 @@ class App:
                         else:
                             ref = max(safe_date(a["date"]) for a in self.data if a.get("date"))
                             self._working_week = iso_year_week_for_date(ref)
-                        self._loaded_week_keys = {_stable_key_fn(a) for a in self.data}
                     except Exception:
                         pass
 
@@ -3052,6 +3145,11 @@ class App:
             return   # stop heartbeat — lock is no longer ours
         self.root.after(LOCK_HEARTBEAT_MS, self._lock_heartbeat)
 
+    def _persist(self) -> None:
+        """Write the table and the list of loaded entries to the share."""
+        write_json(self.data)
+        save_table_state(self._loaded_week_keys)
+
     def _push_undo(self, description: str) -> None:
         import copy
         self._undo_stack.append((
@@ -3077,7 +3175,7 @@ class App:
         if len(entry) >= 4:
             self._working_week     = entry[2]
             self._loaded_week_keys = entry[3]
-        write_json(self.data)
+        self._persist()
         self._clear_table_dirty()
         self.refresh()
         self._status(f"Undone: {desc}")
@@ -3900,8 +3998,7 @@ class App:
         # Auto-set working week from first entry if not already set
         if not self._working_week:
             self._working_week = entry_yw
-            self._loaded_week_keys = set()
-        write_json(self.data)
+        self._persist()
         auto_backup(self.data)
         self._mark_clean()
         self._set_table_dirty()
@@ -3983,7 +4080,7 @@ class App:
         self._pending_duplicate_idx = len(self.data)
         self._new_entry_keys.add(activity_key(item))
         self.data.append(item)
-        write_json(self.data)
+        self._persist()
         self._set_table_dirty()
         self.refresh()
         # Select and scroll to the duplicated row
@@ -4029,7 +4126,7 @@ class App:
                     self.edit_index -= 1
             if self._pending_duplicate_idx is not None and self._pending_duplicate_idx >= idx:
                 self._pending_duplicate_idx = None
-            write_json(self.data)
+            self._persist()
             self._set_table_dirty()
             self.refresh()
             self._status("Entry deleted.")
@@ -4053,7 +4150,7 @@ class App:
             self._working_week = None
             self._loaded_week_keys = set()
             self._clear_table_dirty()
-            write_json(self.data)
+            self._persist()
             self.refresh()
             self.desc.delete("1.0", "end")
             self._status("Table cleared.")
@@ -4101,7 +4198,7 @@ class App:
             self.data = []
             self._working_week = (year, cw)
             self._loaded_week_keys = set()
-            write_json(self.data)
+            self._persist()
             self._clear_table_dirty()
             self.refresh()
             self.week_year.set(str(year))
@@ -4131,7 +4228,7 @@ class App:
             self._loaded_week_keys = {_stable_key_fn(a) for a in loaded}
             self._new_entry_keys  = set()   # reset new entries tracker
             self._working_week = (year, cw)
-            write_json(self.data)
+            self._persist()
             self._clear_table_dirty()   # clean after load — dirty only on actual edits
             self.refresh()
             self._status(f"Loaded CW{cw:02d}/{year} — {len(loaded)} entries. Edit and click 💾 Save week.")
@@ -4188,14 +4285,14 @@ class App:
             self.edit_index = None
             self._mark_clean()
             self.data = merged
-
-            write_json(self.data)
-            self.refresh()
-            self.week_year.set(str(y))
-            self.cw_var.set(str(cw))
             self._working_week     = current_yw
             self._loaded_week_keys = {_stable_key_fn(a) for a in self.data}
             self._new_entry_keys   = set()   # reset new entries tracker
+
+            self._persist()
+            self.refresh()
+            self.week_year.set(str(y))
+            self.cw_var.set(str(cw))
             self._clear_table_dirty()
 
             if self.data:
@@ -4207,24 +4304,21 @@ class App:
             messagebox.showerror("Load error", str(e))
 
     def save_current_week_button(self) -> None:
-        if not self.data:
-            messagebox.showinfo("No data", "No entries to save.")
-            return
         try:
-            wd = weekly_dir(); wd.mkdir(exist_ok=True)
-
             # Group table entries by calendar week
             groups: dict[tuple, list] = {}
             for a in normalise_data(self.data):
                 try:
-                    d   = safe_date(a["date"])
-                    key = iso_year_week_for_date(d)
+                    key = iso_year_week_for_date(safe_date(a["date"]))
                 except Exception:
                     continue
                 groups.setdefault(key, []).append(a)
+            # Weeks where entries were deleted must be saved too, even if the
+            # table has nothing left for them
+            weeks = set(groups) | {w for w in map(_week_of_key, self._loaded_week_keys) if w}
 
-            if not groups:
-                messagebox.showinfo("No data", "No valid entries to save.")
+            if not weeks:
+                messagebox.showinfo("No data", "No entries to save.")
                 return
 
             # Warn if entries span multiple weeks
@@ -4239,49 +4333,12 @@ class App:
                     return
 
             saved = []
-            for (y, cw), entries in groups.items():
-                week_file = wd / f"week_{y}_CW{cw:02d}.json"
-                is_working_week = (self._working_week == (y, cw))
-
-                # Read existing archive from disk
-                existing: list = []
-                if week_file.exists():
-                    try:
-                        existing = normalise_data(
-                            json.loads(week_file.read_text(encoding="utf-8"))
-                        )
-                    except Exception as exc:
-                        log.warning("Could not read %s: %s", week_file, exc)
-
-                if is_working_week:
-                    # Working week — full merge with deletion support
-                    # - Table entries WIN
-                    # - Entries loaded but now deleted → removed
-                    # - Entries from other users (not in loaded_keys) → kept
-                    table_by_stable = {_stable_key_fn(a): a for a in entries}
-                    loaded_keys     = self._loaded_week_keys
-                    merged = []
-                    for a in existing:
-                        sk = _stable_key_fn(a)
-                        if sk in table_by_stable:
-                            pass   # replaced by table version below
-                        elif sk in loaded_keys:
-                            pass   # deleted by user → skip
-                        else:
-                            merged.append(a)  # other user's entry → keep
-                    merged.extend(entries)
-                else:
-                    # Foreign week — never remove existing entries, but an entry
-                    # edited in the table replaces its archived version
-                    merged = merge_entries(existing, entries)
-
-                # Sort
-                merged = normalise_data(merged)
-                merged.sort(key=lambda a: (str(a.get("date", "")),
-                                           str(a.get("user", ""))))
-
-                atomic_write_json(week_file, merged)
-                saved.append(f"CW{cw:02d}/{y} ({len(merged)} entries)")
+            for y, cw in sorted(weeks):
+                # Table entries win, loaded-then-deleted entries are removed,
+                # other users' entries are kept
+                _, count = write_week_archive(y, cw, groups.get((y, cw), []),
+                                              self._loaded_week_keys)
+                saved.append(f"CW{cw:02d}/{y} ({count} entries)")
 
             auto_backup(self.data, force=True)   # always backup on Save week
             self._clear_table_dirty()
@@ -4297,15 +4354,15 @@ class App:
                         if iso_year_week_for_date(safe_date(a["date"])) == target_yw:
                             filtered_data.append(a)
                     except Exception:
-                        pass
+                        filtered_data.append(a)   # unreadable date: keep, never drop
                 self.data = filtered_data
-                # BUG 7: update loaded_week_keys to reflect new archive state
-                self._loaded_week_keys = {_stable_key_fn(a) for a in self.data}
                 self._new_entry_keys   = set()   # after save, nothing is "new" anymore
                 self.edit_index = None
                 self._mark_clean()
-                write_json(self.data)
-                self.refresh()
+            # The archive now matches the table
+            self._loaded_week_keys = {_stable_key_fn(a) for a in self.data}
+            self._persist()
+            self.refresh()
         except Exception as e:
             log.error("save_current_week_button: %s", e)
             messagebox.showerror("Save error", str(e))
@@ -4352,11 +4409,11 @@ class App:
         self.data, was_reset, saved_file = read_json()
         if data_load_warning:
             messagebox.showwarning("Data file problem", data_load_warning)
+        self._loaded_week_keys = load_table_state() | {_stable_key_fn(a) for a in self.data}
         if self.data:
             try:
                 ref = max(safe_date(a["date"]) for a in self.data if a.get("date"))
                 self._working_week = iso_year_week_for_date(ref)
-                self._loaded_week_keys = {_stable_key_fn(a) for a in self.data}
             except Exception:
                 pass
         self.refresh()
@@ -4442,7 +4499,7 @@ class App:
         if not path:
             return
         try:
-            imported = import_activity_table(path)
+            imported, rejected = import_activity_table(path)
             for item in imported:   # files from older versions carry no WP
                 if not item.get("task_wp"):
                     item["task_wp"] = entry_wp(item)
@@ -4455,14 +4512,22 @@ class App:
                     skipped += 1; continue
                 self.data.append(item); existing_keys.add(key); added += 1
             self.last_io_dir = str(Path(path).parent)
-            # Update loaded_week_keys to include imported entries
-            self._loaded_week_keys = {_stable_key_fn(a) for a in self.data}
-            write_json(self.data)
+            # Imported entries now count as loaded. Union, not reassignment:
+            # rebuilding from self.data would forget entries deleted earlier
+            # in this session, and Save week would bring them back.
+            self._loaded_week_keys |= {_stable_key_fn(a) for a in imported}
+            self._persist()
             self._set_table_dirty()
             self.refresh()
-            self._status(f"Import done: {added} added, {skipped} skipped.")
-            messagebox.showinfo("Import completed",
-                f"File: {Path(path).name}\n\nAdded: {added}\nSkipped (duplicates): {skipped}")
+            self._status(f"Import done: {added} added, {skipped} skipped, {len(rejected)} rejected.")
+            msg = (f"File: {Path(path).name}\n\nAdded: {added}\nSkipped (duplicates): {skipped}")
+            if rejected:
+                msg += (f"\nRejected (invalid): {len(rejected)}\n\n"
+                        + "\n".join(rejected[:15])
+                        + ("\n…" if len(rejected) > 15 else ""))
+                messagebox.showwarning("Import completed with errors", msg)
+            else:
+                messagebox.showinfo("Import completed", msg)
         except Exception as e:
             log.error("import_table: %s", e)
             messagebox.showerror("Import error", str(e))
@@ -4530,10 +4595,10 @@ class App:
                     pass
             saved_file = None
             for (gy, gcw), gentries in groups.items():
-                wf = weekly_dir() / f"week_{gy}_CW{gcw:02d}.json"
-                sf = save_weekly_archive(gentries, iso_week_monday(gy, gcw))
-                if sf:
-                    saved_file = sf  # report last saved file
+                saved_file, _ = write_week_archive(gy, gcw, gentries, self._loaded_week_keys)
+            # Archived entries count as loaded, so later deletions reach the archive
+            self._loaded_week_keys |= {_stable_key_fn(a) for a in self.data}
+            self._persist()
         except Exception as e:
             log.error("weekly: %s", e)
             messagebox.showerror("Generation error", str(e)); return
