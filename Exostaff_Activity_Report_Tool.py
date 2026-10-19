@@ -1405,6 +1405,14 @@ def set_cell_text(cell, text: str, align_center: bool = True) -> None:
     if align_center:
         center_cell_content(cell)
 
+def _effort_text(value) -> str:
+    """Effort for the edit form: "1" not "1.0", but never rounded."""
+    try:
+        return f"{float(value):g}"
+    except (TypeError, ValueError):
+        return str(value)
+
+
 def format_effort(value) -> str:
     """Format effort with 2 decimal places max, no trailing zeros.
     Uses Decimal for precision to avoid float rounding artifacts.
@@ -1915,6 +1923,10 @@ def generate_monthly_docx(template_path, data: list, year: int, month: int, out_
         pd = sum(float(a.get("effort", 0) or 0)
                  for (uu, _, _), acts in activities_by_user_task.items() if uu == u for a in acts)
         unmapped.append(f"{u or '(no user)'}: {format_effort(pd)} PD — user not in template")
+    for u in sorted(set(leave_by_user) - set(template_users)):
+        if leave_by_user[u]:
+            unmapped.append(f"{u or '(no user)'}: {format_effort(leave_by_user[u])} days of leave "
+                            "— user not in template")
     # Pre-compute total effort per user (summing across all tasks and WPs)
     effort_by_user: dict[str, float] = {}
     for (u, tn, wp), acts in activities_by_user_task.items():
@@ -2399,9 +2411,16 @@ class SplashScreen:
         self._win.update()
 
     def set_status(self, msg: str) -> None:
+        if getattr(self, "_closed", False):
+            return
         self._sv.set(msg); self._win.update_idletasks()
 
     def close(self) -> None:
+        # Safe to call twice: startup closes the splash early when the lock
+        # dialog is shown, then again at the end (crashed after Force Unlock)
+        if getattr(self, "_closed", False):
+            return
+        self._closed = True
         self._pb.stop(); self._win.destroy()
 
 # ---------------------------------------------------------------------------
@@ -3892,7 +3911,7 @@ class App:
             self.tree.insert("", "end", iid=iid,
                 values=(
                     date_display, a.get("user", ""), entry_type,
-                    task_display, a.get("effort", ""), a.get("description", "")[:120],
+                    task_display, format_effort(a.get("effort", 0)), a.get("description", "")[:120],
                 ),
                 tags=(tag,),
             )
@@ -4165,7 +4184,7 @@ class App:
         self.entry_type_var.set(a.get("entry_type", "Activity"))
         if a.get("entry_type") == "Activity":
             self._update_wp_and_task_from_entry(a)
-        self.effort_var.set(str(a.get("effort", "1")))
+        self.effort_var.set(_effort_text(a.get("effort", 1)))   # no rounding
         self.desc.delete("1.0", "end")
         self.desc.insert("1.0", a.get("description", ""))
         self._mark_clean()
@@ -4221,7 +4240,7 @@ class App:
         self.entry_type_var.set(item.get("entry_type", "Activity"))
         if item.get("entry_type") == "Activity":
             self._update_wp_and_task_from_entry(item)   # restores WP too
-        self.effort_var.set(str(item.get("effort", "1")))
+        self.effort_var.set(_effort_text(item.get("effort", 1)))   # no rounding
         self.desc.delete("1.0", "end")
         self.desc.insert("1.0", item.get("description", ""))
         self.update_task_state()
