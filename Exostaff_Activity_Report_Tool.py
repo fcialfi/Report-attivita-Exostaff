@@ -300,13 +300,17 @@ def auto_update(on_progress=None) -> tuple[bool, str]:
         ':done\r\n'
         'del "%~f0"\r\n'
     )
-    launcher.write_bytes(bat.encode("utf-8"))
-
     import subprocess
-    subprocess.Popen(
-        ["cmd", "/c", str(launcher)],
-        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
-    )
+    try:
+        launcher.write_bytes(bat.encode("utf-8"))
+        subprocess.Popen(
+            ["cmd", "/c", str(launcher)],
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+    except Exception as exc:
+        tmp.unlink(missing_ok=True)
+        return False, (f"Could not prepare the update in:\n{dst.parent}\n\n{exc}\n\n"
+                       "Copy the new exe by hand from the shared folder.")
     return True, f"ok_close:{dst}"
 
 
@@ -351,13 +355,25 @@ HOLIDAYS_TEMPLATE = """# EUMETSAT Public Holidays
 """
 
 
+def read_config_text(path: Path) -> str:
+    """Read a hand-edited config file: UTF-8 with or without BOM (Notepad),
+    falling back to Windows ANSI. A BOM would otherwise turn the first
+    comment line into a user, and ANSI accents (e.g. "Nicolò") crashed
+    the tool at startup."""
+    data = path.read_bytes()
+    try:
+        return data.decode("utf-8-sig")
+    except UnicodeDecodeError:
+        return data.decode("cp1252", errors="replace")
+
+
 def load_holidays() -> dict[date, str]:
     """Load holidays from config/holidays.txt. Returns {date: description}."""
     hf = holidays_file()
     if not hf.exists():
         return {}
     result: dict[date, str] = {}
-    for line in hf.read_text(encoding="utf-8").splitlines():
+    for line in read_config_text(hf).splitlines():
         line = line.strip()
         if not line or line.startswith("#"):
             continue
@@ -458,7 +474,7 @@ def load_users_from_config() -> list[str]:
     if not uf.exists():
         return []
     users = []
-    for line in uf.read_text(encoding="utf-8").splitlines():
+    for line in read_config_text(uf).splitlines():
         line = line.strip()
         if line and not line.startswith("#"):
             users.append(line)
@@ -488,7 +504,7 @@ def load_tasks_from_config() -> tuple[list[tuple], dict[tuple, str], dict[tuple,
     project_map  = {}
     initials_map = {}
     wp_map       = {}
-    for line in tf.read_text(encoding="utf-8").splitlines():
+    for line in read_config_text(tf).splitlines():
         line = line.strip()
         if not line or line.startswith("#"):
             continue
@@ -1820,7 +1836,13 @@ def generate_monthly_docx(template_path, data: list, year: int, month: int, out_
     activities_by_user_task: dict = defaultdict(list)
     leave_by_user: dict = defaultdict(float)
     unmapped: list[str] = []
+    # Match entry users to template names ignoring case and spacing
+    # ("Fabio Cialfi" in users.txt vs "Fabio CIALFI" in the template)
+    _norm_user = lambda u: " ".join(str(u).split()).casefold()
+    tpl_name = {_norm_user(u): u for u in template_users}
+    canon = lambda u: tpl_name.get(_norm_user(u), u)
     for a in normalise_data(data):
+        a = dict(a, user=canon(a.get("user", "")))
         try:
             d = safe_date(a["date"])
         except Exception:
@@ -1840,6 +1862,11 @@ def generate_monthly_docx(template_path, data: list, year: int, month: int, out_
             # FIX C: only count genuine leave entries (not malformed Activities)
             leave_by_user[a.get("user", "")] += float(a.get("effort", 0) or 0)
         # Other entry_types silently ignored
+    # Users with activity but no table in the template: their effort would vanish
+    for u in sorted({u for (u, _, _) in activities_by_user_task} - set(template_users)):
+        pd = sum(float(a.get("effort", 0) or 0)
+                 for (uu, _, _), acts in activities_by_user_task.items() if uu == u for a in acts)
+        unmapped.append(f"{u or '(no user)'}: {format_effort(pd)} PD — user not in template")
     # Pre-compute total effort per user (summing across all tasks and WPs)
     effort_by_user: dict[str, float] = {}
     for (u, tn, wp), acts in activities_by_user_task.items():
@@ -3975,6 +4002,9 @@ class App:
             pass
         # No week restriction — entries from any week can coexist in the table.
         # Auto-archiving happens automatically on startup when a new week begins.
+        if not self.user_var.get().strip():
+            messagebox.showerror("Input error", "Select a user (see config/users.txt).")
+            return
         entry_type = self.entry_type_var.get()
         if entry_type == "Activity":
             try:
@@ -5222,7 +5252,7 @@ will show the new version number on next launch.
                                          bg=BG_ENTRY, fg=FG_MAIN, padx=10, pady=10)
         txt.pack(fill="both", expand=True)
         if filepath.exists():
-            txt.insert("1.0", filepath.read_text(encoding="utf-8"))
+            txt.insert("1.0", read_config_text(filepath))
 
         btn_frame = tk.Frame(win, bg=BG_PANEL)
         btn_frame.pack(fill="x", pady=6)
@@ -5361,9 +5391,13 @@ will show the new version number on next launch.
             win.update()
 
             def _run():
-                ok, msg = auto_update(
-                    on_progress=lambda m: self.root.after(0, lambda: status_var.set(m))
-                )
+                try:
+                    ok, msg = auto_update(
+                        on_progress=lambda m: self.root.after(0, lambda: status_var.set(m))
+                    )
+                except Exception as exc:   # never leave the dialog stuck
+                    log.error("auto_update: %s", exc)
+                    ok, msg = False, str(exc)
                 if ok and msg.startswith("ok_close:"):
                     exe_path = msg.split(":", 1)[1]
                     exe_dir  = str(Path(exe_path).parent)
