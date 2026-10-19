@@ -1094,6 +1094,18 @@ def write_week_archive(year: int, cw: int, entries: list,
     return week_file, len(merged)
 
 
+def load_week_entries(year: int, cw: int) -> list:
+    """Entries archived for one week ([] if none or unreadable)."""
+    wf = weekly_dir() / f"week_{year}_CW{cw:02d}.json"
+    if not wf.exists():
+        return []
+    try:
+        return normalise_data(json.loads(wf.read_text(encoding="utf-8")))
+    except Exception as exc:
+        log.warning("load_week_entries %s: %s", wf, exc)
+        return []
+
+
 def save_weekly_archive(data: list, ref_date: date | None = None,
                         loaded_keys: set | frozenset = frozenset()) -> Path | None:
     if ref_date is None:
@@ -1187,7 +1199,13 @@ def read_json() -> tuple[list, bool, Path | None]:
         return data, reset_done, saved_file
     return [], False, None
 
+# Weekly files that could not be read by the last monthly load (shown to the user)
+skipped_archives: list[str] = []
+
+
 def load_monthly_data_from_weekly_reports(year: int, month: int) -> list:
+    global skipped_archives
+    skipped_archives = []
     wd = weekly_dir(); wd.mkdir(exist_ok=True)
     month_start = date(year, month, 1)
     month_end   = last_day_of_month(year, month)
@@ -1198,17 +1216,23 @@ def load_monthly_data_from_weekly_reports(year: int, month: int) -> list:
             items = normalise_data(json.loads(path.read_text(encoding="utf-8")))
         except Exception as exc:
             log.warning("Skipping unreadable weekly file %s: %s", path, exc)
+            skipped_archives.append(path.name)
             continue
+        in_file: set = set()
         for a in items:
             try:
                 d = safe_date(a["date"])
             except Exception:
                 continue
             if month_start <= d <= month_end:
+                # Skip the same entry found again in ANOTHER weekly file, but
+                # keep identical entries within one week (e.g. 2 x 0.5 PD "Meetings")
                 key = activity_key(a)
-                if key not in seen:
-                    monthly_data.append(a)
-                    seen.add(key)
+                if key in seen and key not in in_file:
+                    continue
+                monthly_data.append(a)
+                in_file.add(key)
+        seen |= in_file
     return normalise_data(monthly_data)
 
 # ---------------------------------------------------------------------------
@@ -1754,7 +1778,15 @@ def _match_template_row(entry: dict, task_rows: list[tuple], table_wp: str) -> i
 
 def generate_monthly_docx(template_path, data: list, year: int, month: int, out_path: str) -> list[str]:
     """Fill the Word template. Returns warnings for entries that could not be placed."""
-    doc        = Document(template_path)
+    # Update month/date text on a copy of the TEMPLATE first: patching the
+    # finished document would also rewrite users' descriptions
+    # (e.g. "the April 2026 review" -> "the September 2026 review").
+    import tempfile
+    with tempfile.TemporaryDirectory() as td:
+        patched = Path(td) / "template.docx"
+        shutil.copy2(template_path, patched)
+        patch_month_and_date_in_docx_file(patched, year, month)
+        doc = Document(str(patched))
     month_start = date(year, month, 1)
     month_end   = last_day_of_month(year, month)
     user_tables = get_user_tables(doc)
@@ -1930,7 +1962,6 @@ def generate_monthly_docx(template_path, data: list, year: int, month: int, out_
             for cell in row.cells:
                 center_cell_content(cell)
     doc.save(out_path)
-    patch_month_and_date_in_docx_file(out_path, year, month)
     for msg in unmapped:
         log.warning("monthly: %s", msg)
     return unmapped
@@ -2517,8 +2548,9 @@ class StatsWindow(_FittedToplevel):
                           and d.weekday() < 5}
         working_days   = total_days - weekend_days - len(month_holidays)
 
-        # Number of active users in this month
-        active_users = sorted({a.get("user", "") for a in filtered if a.get("user")})
+        # Number of active users in this month — including users who were
+        # only on leave, otherwise their leave lowers "expected" below zero
+        active_users = sorted({a.get("user", "") for a in filtered + leave_entries if a.get("user")})
         n_users      = max(len(active_users), 1)
 
         # Total capacity = working_days × n_users
@@ -3911,15 +3943,14 @@ class App:
                 f"Effort is {effort} PD — this exceeds one full working day.\n\nSave anyway?",
             ):
                 return
-        # Warn if total effort for this date+user would exceed 1.0 PD
-        # (when editing, the entry's old value is excluded)
+        # Warn if total effort for this date+user would exceed 1.0 PD,
+        # leave included (when editing, the entry's old value is excluded)
         try:
             same_day = [
                 a for i, a in enumerate(self.data)
                 if i != self.edit_index
                 and a.get("date") == entry_date.isoformat()
                 and a.get("user") == self.user_var.get()
-                and a.get("entry_type") == "Activity"
             ]
             day_total = sum(float(a.get("effort", 0) or 0) for a in same_day) + effort
             if day_total > 1.0:
@@ -4063,36 +4094,23 @@ class App:
         self._mark_clean()   # after the reset, so default values don't count as edits
 
     def duplicate_selected(self) -> None:
+        """Copy the selected entry into the form as a NEW entry. Nothing is
+        added until Save entry, so an abandoned copy can't be counted twice."""
         idx = self.selected_index()
         if idx is None:
             return
-        import copy
-        item = copy.deepcopy(normalise_activity(self.data[idx]))
-        # Set date to today and clear description so user fills it in
-        # Use a date within the working week (Monday) or today if no working week
-        if self._working_week:
-            yw_date = iso_week_monday(*self._working_week)
-            item["date"] = yw_date.isoformat()
-        else:
-            item["date"] = date.today().isoformat()
-        self._push_undo("duplicate entry")
-        # Track pending duplicate BEFORE refresh so tag is applied immediately
-        self._pending_duplicate_idx = len(self.data)
-        self._new_entry_keys.add(activity_key(item))
-        self.data.append(item)
-        self._persist()
-        self._set_table_dirty()
-        self.refresh()
-        # Select and scroll to the duplicated row
-        children = self.tree.get_children()
-        if children:
-            last_iid = children[-1]
-            self.tree.selection_set(last_iid)
-            self.tree.see(last_iid)
-        # Load duplicate into form — edit_index points to the appended copy
-        self.edit_index = len(self.data) - 1
-        _dup_date = safe_date(item["date"])
-        self.date_var.set(_dup_date.strftime("%d/%m/%y"))
+        if self._form_dirty() and not messagebox.askyesno(
+            "Discard changes",
+            "The form has changes that are not saved.\nDiscard them and copy the selected entry?",
+        ):
+            return
+        item = normalise_activity(self.data[idx])
+        self.edit_index = None   # Save entry will ADD
+        # Date: today if it is in the working week, else that week's Monday
+        target = date.today()
+        if self._working_week and iso_year_week_for_date(target) != self._working_week:
+            target = iso_week_monday(*self._working_week)
+        self.date_var.set(target.strftime("%d/%m/%y"))
         self.user_var.set(item.get("user", ""))
         self.entry_type_var.set(item.get("entry_type", "Activity"))
         if item.get("entry_type") == "Activity":
@@ -4101,8 +4119,8 @@ class App:
         self.desc.delete("1.0", "end")
         self.desc.insert("1.0", item.get("description", ""))
         self.update_task_state()
-        self._mark_clean()   # the copy is already in the table
-        self._status("Entry duplicated — edit and save.")
+        self._mark_clean()
+        self._status("Copy loaded in the form — adjust date/description and click Save entry.")
 
     def _show_context_menu(self, event) -> None:
         row = self.tree.identify_row(event.y)
@@ -4179,9 +4197,18 @@ class App:
         try:
             year = int(self.week_year.get())
             cw   = int(self.cw_var.get())
+            iso_week_monday(year, cw)   # e.g. CW54 does not exist
         except Exception:
             messagebox.showerror("Input error", "Please set a valid Year and CW first.")
             return
+
+        # Checked first: both branches below replace the table
+        if self._table_dirty:
+            if not messagebox.askyesno(
+                "Unsaved changes",
+                f"You have unsaved changes.\n\nLoading CW{cw:02d}/{year} will discard them.\n\nContinue?",
+            ):
+                return
 
         week_file = weekly_dir() / f"week_{year}_CW{cw:02d}.json"
         if not week_file.exists():
@@ -4208,14 +4235,6 @@ class App:
             self._status(f"New week CW{cw:02d}/{year} ready — "
                          f"{mon.strftime('%d %b')} → {(mon + timedelta(days=4)).strftime('%d %b %Y')}")
             return
-
-        # Warn only if there are unsaved changes
-        if self._table_dirty:
-            if not messagebox.askyesno(
-                "Unsaved changes",
-                f"You have unsaved changes.\n\nLoading CW{cw:02d}/{year} will discard them.\n\nContinue?",
-            ):
-                return
 
         try:
             loaded = normalise_data(json.loads(week_file.read_text(encoding="utf-8")))
@@ -4554,8 +4573,12 @@ class App:
             y, m = map(int, self.month_var.get().split("-"))
         except Exception:
             messagebox.showerror("Input error", "Month must be YYYY-MM."); return
-        all_data = merge_entries(load_monthly_data_from_weekly_reports(y, m),
-                                 self._table_entries_in_month(y, m))
+        all_data = merge_week(load_monthly_data_from_weekly_reports(y, m),
+                              self._table_entries_in_month(y, m), self._loaded_week_keys)
+        if skipped_archives:
+            messagebox.showwarning("Unreadable weekly files",
+                                   "These weekly files could not be read and are NOT included:\n\n"
+                                   + "\n".join(skipped_archives))
         StatsWindow(self.root, all_data, y, m)
 
     def _table_entries_in_month(self, y: int, m: int) -> list:
@@ -4580,12 +4603,7 @@ class App:
             year = int(self.week_year.get())
             cw   = int(self.cw_var.get())
             start, end = cw_range(year, cw)
-            plan = load_next_week_plan(week_after(year, cw))
-            txt  = generate_weekly_text(
-                self.data, start.isoformat(), end.isoformat(),
-                cw=cw, year=year, next_week_plan=plan or None,
-            )
-            # BUG F fix: archive each week's entries to its own file
+            # Archive the table first (each week to its own file) ...
             groups: dict[tuple, list] = {}
             for a in normalise_data(self.data):
                 try:
@@ -4599,6 +4617,16 @@ class App:
             # Archived entries count as loaded, so later deletions reach the archive
             self._loaded_week_keys |= {_stable_key_fn(a) for a in self.data}
             self._persist()
+            # ... then summarise the selected week from the archive, so it also
+            # works for a week that is not loaded in the table
+            nxt = week_after(year, cw)
+            week_data = merge_entries(load_week_entries(year, cw) + load_week_entries(*nxt),
+                                      normalise_data(self.data))
+            plan = load_next_week_plan(nxt)
+            txt  = generate_weekly_text(
+                week_data, start.isoformat(), end.isoformat(),
+                cw=cw, year=year, next_week_plan=plan or None,
+            )
         except Exception as e:
             log.error("weekly: %s", e)
             messagebox.showerror("Generation error", str(e)); return
@@ -4700,8 +4728,10 @@ class App:
                 monthly_data = load_monthly_data_from_weekly_reports(y, m)
                 log.warning("monthly: loaded %d entries from archives", len(monthly_data))
 
-                # Table entries (possibly edited, not yet saved) win over archive
-                monthly_data = merge_entries(monthly_data, self._table_entries_in_month(y, m))
+                # Table (edited/deleted, not yet saved) wins over the archive
+                monthly_data = merge_week(monthly_data, self._table_entries_in_month(y, m),
+                                          self._loaded_week_keys)
+                result["skipped"] = list(skipped_archives)
 
                 log.warning("monthly: total %d entries after merge", len(monthly_data))
 
@@ -4750,6 +4780,13 @@ class App:
                 ):
                     return
                 generate_monthly_docx(self.template_path, [], y, m, out)
+
+            if result.get("skipped"):
+                messagebox.showwarning(
+                    "Unreadable weekly files",
+                    "These weekly files could not be read and are NOT included in the report:\n\n"
+                    + "\n".join(result["skipped"]),
+                )
 
             if result.get("unmapped"):
                 messagebox.showwarning(
