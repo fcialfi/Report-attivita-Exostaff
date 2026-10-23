@@ -3004,6 +3004,11 @@ class TrendWindow(_FittedToplevel):
     task (or of all tasks) per month. `loader(start_date, end_date)` returns
     the entries of the period (archives + current table)."""
     ROW_H, MONTH_W, TOTAL_W = 22, 56, 62
+    # stacked "all tasks" chart: the TOP_N largest tasks get a colour, the rest is "Other"
+    TOP_N = 8
+    PALETTE = ["#4e79a7", "#f28e2b", "#59a14f", "#e15759", "#76b7b2",
+               "#edc948", "#b07aa1", "#9c755f"]
+    OTHER = "#bab0ac"
     WP_W, NO_W, TITLE_W = 46, 38, 270
 
     def __init__(self, parent, loader, users: list[str], wps: list[str],
@@ -3176,20 +3181,33 @@ class TrendWindow(_FittedToplevel):
             return
         if self._selected is not None:
             r = self._rows[self._selected]
-            values = [r["months"].get(ym, 0.0) for ym in self._months]
+            series = [(None, ACCENT_DARK, [r["months"].get(ym, 0.0) for ym in self._months])]
             title = f"{r['wp'] or '?'} task {r['task_no']} — {r['title']}"
         else:
-            values = [sum(r["months"].get(ym, 0.0) for r in self._rows) for ym in self._months]
+            top = sorted(self._rows, key=lambda r: -r["total"])[:self.TOP_N]
+            series = [(trend_label(r), self.PALETTE[i], [r["months"].get(ym, 0.0) for ym in self._months])
+                      for i, r in enumerate(top)]
+            rest = [r for r in self._rows if r not in top]
+            if rest:
+                series.append((f"Other ({len(rest)})", self.OTHER,
+                               [sum(r["months"].get(ym, 0.0) for r in rest) for ym in self._months]))
             title = "All tasks"
+        values = [sum(sv[i] for _, _, sv in series) for i in range(len(self._months))]
+        legend_w = 120 if any(name for name, _, _ in series) else 0
         if len(title) > 110:
             title = title[:108] + "…"
         c.create_text(10, 12, text=f"{title}  (PD per month)", anchor="w", fill=FG_MAIN,
                       font=("Segoe UI", 9, "bold"))
-        left, right, top, bottom = 44, 12, 30, 24
+        left, right, top, bottom = 44, 12 + legend_w, 30, 24
+        for k, (name, colour, _) in enumerate(n for n in series if n[0]):
+            ly = top + 16 * k
+            c.create_rectangle(w - legend_w, ly, w - legend_w + 10, ly + 10, fill=colour, width=0)
+            c.create_text(w - legend_w + 16, ly + 5, text=name, anchor="w", fill=FG_MAIN,
+                          font=("Segoe UI", 8))
         # round gridline step (0.5, 1, 2, 5, 10 ... PD), about 4 lines
         step = next((st for st in (0.5, 1, 2, 5, 10, 20, 50, 100, 200, 500, 1000)
-                     if max(values) / st <= 5), 2000)
-        peak = step * max(1, math.ceil(max(values) / step))
+                     if max(values or [0]) / st <= 5), 2000)
+        peak = step * max(1, math.ceil(max(values or [0]) / step))
         for k in range(int(round(peak / step)) + 1):
             v = step * k
             y = h - bottom - (h - top - bottom) * v / peak
@@ -3201,8 +3219,15 @@ class TrendWindow(_FittedToplevel):
         for i, v in enumerate(values):
             x = left + slot * i + slot / 2
             y = h - bottom - (h - top - bottom) * v / peak
+            base = 0.0
+            for _, colour, sv in series:   # stacked from the bottom
+                if sv[i]:
+                    y_lo = h - bottom - (h - top - bottom) * base / peak
+                    base += sv[i]
+                    y_hi = h - bottom - (h - top - bottom) * base / peak
+                    c.create_rectangle(x - bw / 2, y_hi, x + bw / 2, y_lo, fill=colour,
+                                       outline=BG_PANEL)
             if v:
-                c.create_rectangle(x - bw / 2, y, x + bw / 2, h - bottom, fill=ACCENT_DARK, width=0)
                 c.create_text(x, y - 7, text=format_effort(v), fill=FG_MAIN, font=("Segoe UI", 7))
             y_, m_ = self._months[i]
             c.create_text(x, h - bottom + 10, text=month_label(date(y_, m_, 1)), fill=FG_DIM,
