@@ -1140,10 +1140,11 @@ def table_state_file() -> Path:
     return data_file().with_name("activities_current.state.json")
 
 
-def save_table_state(loaded_keys: set) -> None:
+def save_table_state(loaded_keys) -> None:
+    """loaded_keys: Counter (or set) of loaded entries; one item per copy."""
     try:
         atomic_write_json(table_state_file(),
-                          {"loaded_keys": sorted(list(k) for k in loaded_keys)})
+                          {"loaded_keys": sorted(list(k) for k in Counter(loaded_keys).elements())})
     except Exception as exc:
         log.warning("save_table_state failed: %s", exc)
 
@@ -1176,15 +1177,34 @@ def _is_loaded(a: dict, loaded_keys) -> bool:
             or _stable_key_fn(a) in loaded_keys)
 
 
-def load_table_state() -> set:
+def loaded_counter(entries) -> Counter:
+    """Loaded keys of these entries, one count per copy (two identical
+    0.5 PD "Meetings" are two loaded entries)."""
+    return Counter(loaded_key(a) for a in entries)
+
+
+def load_table_state() -> Counter:
     try:
         raw = json.loads(table_state_file().read_text(encoding="utf-8"))
-        return {_canonical_state_key(tuple(str(x) for x in k)) for k in raw.get("loaded_keys", [])}
+        return Counter(_canonical_state_key(tuple(str(x) for x in k)) for k in raw.get("loaded_keys", []))
     except FileNotFoundError:
-        return set()
+        return Counter()
     except Exception as exc:
         log.warning("load_table_state failed: %s", exc)
-        return set()
+        return Counter()
+
+
+def startup_loaded_keys(data: list) -> Counter:
+    """Loaded entries at start: the saved state; without one (very old
+    versions) every table entry counts as loaded."""
+    if table_state_file().exists():
+        return load_table_state()
+    return loaded_counter(data)
+
+
+def forget_week(loaded_keys, week: tuple[int, int]) -> Counter:
+    """loaded_keys without the keys of one week."""
+    return Counter({k: n for k, n in Counter(loaded_keys).items() if _week_of_key(k) != week})
 
 
 def _week_of_key(key: tuple) -> tuple[int, int] | None:
@@ -1202,7 +1222,18 @@ def merge_week(existing: list, entries: list, loaded_keys: set | frozenset = fro
     # An archived entry that was never loaded is a different activity, even
     # when identical to a table entry (a second 0.5 PD "Meetings" the same
     # day): it is kept. Re-imported copies are filtered out by import_table.
-    return [a for a in existing if not _is_loaded(a, loaded_keys)] + list(entries)
+    remaining = Counter(loaded_keys)
+    kept = []
+    for a in existing:
+        k = loaded_key(a)
+        if remaining[k] > 0:
+            remaining[k] -= 1             # this copy was loaded: the table has it
+            continue
+        # keys of older versions (no WP / stable 5-field): every match
+        if activity_key(a) in loaded_keys or _stable_key_fn(a) in loaded_keys:
+            continue
+        kept.append(a)
+    return kept + list(entries)
 
 
 def write_week_archive(year: int, cw: int, entries: list,
@@ -1294,7 +1325,12 @@ def reset_if_new_week(data: list) -> tuple[list, bool, Path | None]:
     # Genuine week change: archive past weeks (additions, edits and deletions)
     last_saved = None
     for yw_y, yw_cw in sorted(past_weeks):
-        last_saved, _ = write_week_archive(yw_y, yw_cw, groups.get((yw_y, yw_cw), []), loaded)
+        week_entries = groups.get((yw_y, yw_cw), [])
+        last_saved, _ = write_week_archive(yw_y, yw_cw, week_entries, loaded)
+        # recorded at once: if a later week fails, the next start must not
+        # archive this one again (duplicates)
+        loaded = forget_week(loaded, (yw_y, yw_cw)) + loaded_counter(week_entries)
+        save_table_state(loaded)
 
     # Load current week from archive (may already have entries saved earlier)
     y, cw = current_yw
@@ -1314,7 +1350,7 @@ def reset_if_new_week(data: list) -> tuple[list, bool, Path | None]:
 
     current_from_archive += undated
     write_json(current_from_archive)
-    save_table_state({loaded_key(a) for a in current_from_archive})
+    save_table_state(loaded_counter(current_from_archive))
     return current_from_archive, True, last_saved
 
 # Set when the data file could not be read — shown to the user by the App
@@ -3633,7 +3669,7 @@ class App:
         self.edit_index:       int | None = None
         self._undo_stack:      list       = []
         self._save_count:      int        = 0
-        self._loaded_week_keys: set       = set()
+        self._loaded_week_keys: Counter   = Counter()
         self._table_dirty:     bool       = False
         self._working_week:         tuple | None = None
         self._pending_duplicate_idx: int | None  = None
@@ -3696,8 +3732,7 @@ class App:
                 self.data, was_reset, saved_file = read_json()
                 # Entries loaded in the previous session (incl. deleted ones
                 # whose deletion still has to reach the archive)
-                self._loaded_week_keys = (load_table_state()
-                                          | {loaded_key(a) for a in self.data})
+                self._loaded_week_keys = startup_loaded_keys(self.data)
                 self._table_dirty_after_load()
                 # Set working week
                 if self.data:
@@ -4992,7 +5027,7 @@ class App:
             self.data = []
             self.edit_index = None
             self._working_week = None
-            self._loaded_week_keys = set()
+            self._loaded_week_keys = Counter()
             self._clear_table_dirty()
             self._persist()
             self.refresh()
@@ -5052,7 +5087,7 @@ class App:
             self._mark_clean()
             self.data = []
             self._working_week = (year, cw)
-            self._loaded_week_keys = set()
+            self._loaded_week_keys = Counter()
             self._persist()
             self._clear_table_dirty()
             self.refresh()
@@ -5072,7 +5107,7 @@ class App:
             self.data = loaded
             # Track which entries were present when week was loaded
             # so deletions are respected on Save week
-            self._loaded_week_keys = {loaded_key(a) for a in loaded}
+            self._loaded_week_keys = loaded_counter(loaded)
             self._new_entry_keys  = set()   # reset new entries tracker
             self._working_week = (year, cw)
             self._persist()
@@ -5137,10 +5172,9 @@ class App:
             self._working_week     = current_yw
             # archived entries edited or deleted in the table must stay
             # "loaded", or Save week would keep their old versions
-            self._loaded_week_keys = ({loaded_key(a) for a in from_archive}
-                                      | {loaded_key(a) for a in self.data}
-                                      | {k for k in self._loaded_week_keys
-                                         if _week_of_key(k) == current_yw})
+            old_week = self._loaded_week_keys - forget_week(self._loaded_week_keys, current_yw)
+            self._loaded_week_keys = (loaded_counter(from_archive) | loaded_counter(self.data)
+                                      | old_week)
             self._new_entry_keys   = set()   # reset new entries tracker
 
             self._persist()
@@ -5194,8 +5228,13 @@ class App:
             for y, cw in sorted(weeks):
                 # Table entries win, loaded-then-deleted entries are removed,
                 # other users' entries are kept
-                _, count = write_week_archive(y, cw, groups.get((y, cw), []),
-                                              self._loaded_week_keys)
+                week_entries = groups.get((y, cw), [])
+                _, count = write_week_archive(y, cw, week_entries, self._loaded_week_keys)
+                # recorded at once, so a failure on a later week cannot make a
+                # retry write this one twice
+                self._loaded_week_keys = (forget_week(self._loaded_week_keys, (y, cw))
+                                          + loaded_counter(week_entries))
+                save_table_state(self._loaded_week_keys)
                 saved.append(f"CW{cw:02d}/{y} ({count} entries)")
 
             auto_backup(self.data, force=True)   # always backup on Save week
@@ -5221,7 +5260,7 @@ class App:
                 self.edit_index = None
                 self._mark_clean()
             # The archive now matches the table
-            self._loaded_week_keys = {loaded_key(a) for a in self.data}
+            self._loaded_week_keys = loaded_counter(self.data)
             self._persist()
             self.refresh()
         except Exception as e:
@@ -5274,7 +5313,7 @@ class App:
         self.data, was_reset, saved_file = read_json()
         if data_load_warning:
             messagebox.showwarning("Data file problem", data_load_warning)
-        self._loaded_week_keys = load_table_state() | {loaded_key(a) for a in self.data}
+        self._loaded_week_keys = startup_loaded_keys(self.data)
         self._table_dirty_after_load()
         if self.data:
             try:
@@ -5508,12 +5547,14 @@ class App:
             weeks = set(groups) | {w for w in map(_week_of_key, self._loaded_week_keys) if w}
             writable = not read_only and self._lock_still_ours()
             for gy, gcw in (sorted(weeks) if writable else []):
-                saved_file, _ = write_week_archive(gy, gcw, groups.get((gy, gcw), []),
-                                                   self._loaded_week_keys)
+                week_entries = groups.get((gy, gcw), [])
+                saved_file, _ = write_week_archive(gy, gcw, week_entries, self._loaded_week_keys)
+                # archived entries count as loaded, so later edits/deletions
+                # reach the archive; recorded week by week (see Save week)
+                self._loaded_week_keys = (forget_week(self._loaded_week_keys, (gy, gcw))
+                                          + loaded_counter(week_entries))
             if writable and weeks:
                 self._undo_stack.clear()   # see save_current_week_button
-            # Archived entries count as loaded, so later deletions reach the archive
-            self._loaded_week_keys |= {loaded_key(a) for a in self.data}
             self._persist()
             # ... then summarise the selected week from the archive, so it also
             # works for a week that is not loaded in the table
