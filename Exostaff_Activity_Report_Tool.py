@@ -26,7 +26,6 @@ import math
 import csv
 import os
 import sys
-import signal
 import socket
 import time
 import logging
@@ -279,7 +278,7 @@ def auto_update(on_progress=None) -> tuple[bool, str]:
     if same:
         return False, ("You are running the exe directly from the shared folder.\n"
                        "Copy it to your PC (e.g. Desktop) and start it from there.")
-    progress(f"Copying from share…")
+    progress("Copying from share…")
 
     # Copy new exe to a temp file next to current exe
     tmp = dst.with_name(dst.stem + "_new.exe")
@@ -3009,7 +3008,7 @@ class StatsWindow(_FittedToplevel):
             if tip:
                 add_tooltip(lbl, tip)
 
-        _cell(panel, f"Working days",
+        _cell(panel, "Working days",
               f"{working_days}",
               tip=f"{total_days} days − {weekend_days} weekends − {len(month_holidays)} holidays",
               col=0)
@@ -3554,8 +3553,6 @@ class App:
 
         FONT_UI    = ("Segoe UI", 9)
         FONT_BOLD  = ("Segoe UI", 9, "bold")
-        FONT_SMALL = ("Segoe UI", 8)
-        FONT_MONO  = ("Consolas", 9)
 
         root.configure(bg=BG_ROOT)
 

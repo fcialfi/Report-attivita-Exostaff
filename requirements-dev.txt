@@ -1,0 +1,5 @@
+python-docx
+lxml
+openpyxl
+pytest
+pyflakes
