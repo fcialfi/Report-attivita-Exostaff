@@ -1793,6 +1793,25 @@ def load_next_week_plan(target: tuple[int, int] | None = None) -> dict[str, list
     return raw
 
 
+def regroup_plan(plan: dict[str, list[str]], groups: list[str],
+                 mark: bool = False) -> dict[str, list[str]]:
+    """Move plan sections that are not among `groups` (e.g. "EPS-Sterna",
+    saved by a version that grouped by project) into a group: the project's
+    WP if it has only one, otherwise the first group. With `mark`, a comment
+    line says where moved lines came from (the editor ignores # lines)."""
+    if not groups:
+        return dict(plan)
+    out = {g: list(plan.get(g, [])) for g in groups if g in plan}
+    for key, items in plan.items():
+        if key in groups or not items:
+            continue
+        wps = {wp for (_, wp), proj in _project_map.items() if proj == key and wp in groups}
+        target = wps.pop() if len(wps) == 1 else groups[0]
+        moved = ([f"# from {key} (older plan): check the WP"] if mark else []) + list(items)
+        out.setdefault(target, []).extend(moved)
+    return out
+
+
 def save_next_week_plan(plan: dict[str, list[str]], target: tuple[int, int]) -> None:
     try:
         atomic_write_json(next_week_file(), {"target_week": list(target), "plan": plan})
@@ -1817,8 +1836,9 @@ def generate_weekly_text(
 
     # Next-week items: prefer explicit plan, fall back to data
     if next_week_plan:
-        next_steps = {k: [_clean_bullet(b) for b in v if b.strip()]
-                      for k, v in next_week_plan.items()}
+        plan = regroup_plan(next_week_plan, configured_groups())
+        next_steps = {k: [_clean_bullet(b) for b in v if b.strip() and not b.strip().startswith("#")]
+                      for k, v in plan.items()}
     else:
         next_start = start + timedelta(days=7)
         next_end   = end   + timedelta(days=7)
@@ -1830,10 +1850,11 @@ def generate_weekly_text(
             return
         lines.append(f"{key}:")
         if items:
-            for desc in items:
-                lines.append(f"o\t{desc}")
+            # plain lines: the mail client adds its own bullets on paste
+            lines.extend(items)
         else:
-            lines.append(f"\t{empty_label}")
+            lines.append(empty_label)
+        lines.append("")
 
     lines: list[str] = []
     if year and cw:
@@ -1849,7 +1870,6 @@ def generate_weekly_text(
         all_keys = ["EPS-Sterna", "EPS-Aeolus", "Common"]
     for key in all_keys:
         add_section(lines, key, achievements.get(key, []), "No activities this week.")
-    lines.append("")
     lines.append("Next week")
     lines.append("")
     next_keys = sorted(set(configured_groups()) | set(next_steps), key=order) or all_keys
@@ -2541,6 +2561,8 @@ class NextWeekEditor(_FittedToplevel):
         wps = sorted({wp for _, _, wp in tasks if wp},
                      key=lambda w: (0 if w.upper().startswith("WP") else 1, w))
         groups = wps or self.DEFAULT_GROUPS
+        if wps:   # sections of older plans (by project) go into the WP tabs
+            self._plan = regroup_plan(self._plan, wps, mark=True)
         self.PROJECTS = groups + [k for k in self._plan if k not in groups]
         self._texts: dict[str, tk.Text] = {}
         self._build()
@@ -2587,7 +2609,8 @@ class NextWeekEditor(_FittedToplevel):
         self._qa_task    = tk.StringVar()
         self._qa_desc    = tk.StringVar()
 
-        ttk.Label(qa_frame, text="Project").grid(row=0, column=0, padx=6, pady=4)
+        ttk.Label(qa_frame, text="WP" if any(wp for _, _, wp in self.tasks) else "Project").grid(
+            row=0, column=0, padx=6, pady=4)
         ttk.Combobox(qa_frame, textvariable=self._qa_project, values=self.PROJECTS,
                      width=14, state="readonly").grid(row=0, column=1, padx=4, pady=4)
 
