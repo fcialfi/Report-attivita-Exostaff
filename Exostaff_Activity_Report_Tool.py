@@ -21,6 +21,7 @@ Changes vs v3:
 
 import io
 import json
+import re
 import math
 import csv
 import os
@@ -384,15 +385,14 @@ def load_holidays() -> dict[date, str]:
         line = line.strip()
         if not line or line.startswith("#"):
             continue
-        parts = [p.strip() for p in line.split("|", 1)]
-        if not parts:
-            continue
+        # "2026-12-25 | Xmas", "2026-12-25<TAB>Xmas", "25/12/2026 Xmas"
+        parts = re.split(r"\s*\|\s*|\t+|\s+", line, maxsplit=1)
         try:
-            d    = datetime.strptime(parts[0], "%Y-%m-%d").date()
-            desc = parts[1] if len(parts) > 1 else ""
-            result[d] = desc
-        except Exception:
-            pass
+            d = safe_date(parts[0])
+        except ValueError:
+            log.warning("holidays.txt: line not understood, ignored: %r", line)
+            continue
+        result[d] = parts[1].strip() if len(parts) > 1 else ""
     return result
 
 
@@ -480,10 +480,13 @@ def load_users_from_config() -> list[str]:
     uf = users_file()
     if not uf.exists():
         return []
-    users = []
+    users, seen = [], set()
     for line in read_config_text(uf).splitlines():
         line = line.strip()
-        if line and not line.startswith("#"):
+        key = " ".join(line.split()).casefold()
+        # the same person written twice ("fabio cialfi"): first spelling wins
+        if line and not line.startswith("#") and key not in seen:
+            seen.add(key)
             users.append(line)
     return users
 
@@ -492,6 +495,13 @@ def _looks_like_initials(text: str) -> bool:
     import re
     tokens = text.split()
     return bool(tokens) and all(re.fullmatch(r"[A-Z][a-z][A-Z]", t) for t in tokens)
+
+
+def normalise_wp(text: str) -> str:
+    """"wp6", "WP06", "WP-06" -> "WP6"; "slm" -> "SLM"; "" stays ""."""
+    t = " ".join(str(text or "").split()).upper()
+    m = re.fullmatch(r"WP[-\s]?0*(\d+)", t)
+    return f"WP{int(m.group(1))}" if m else t
 
 
 def load_tasks_from_config() -> tuple[list[tuple], dict[tuple, str], dict[tuple, list[str]], dict[tuple, str]]:
@@ -536,7 +546,7 @@ def load_tasks_from_config() -> tuple[list[tuple], dict[tuple, str], dict[tuple,
             p3 = parts[3].strip()
             upper = p3.upper()
             if upper.startswith("WP") or upper in ("SLM", "SLM2"):
-                wp    = p3
+                wp    = normalise_wp(p3)
                 inits = parts[4].split() if len(parts) > 4 else []
             else:
                 # No WP field — parts[3] are initials
@@ -584,6 +594,7 @@ def reload_config() -> tuple[list[str], list[tuple]]:
 
 
 ENTRY_TYPES = ["Activity", "Holiday", "Sick Leave"]
+NO_WP = "(no WP)"   # WP dropdown choice for tasks.txt lines without a WP
 
 TEMPLATE_REPLACEMENTS: list[tuple[str, str]] = [
     ("Monthly activity report for April 2026", "title"),
@@ -757,7 +768,23 @@ def _write_lock(since: str | None = None) -> None:
         "heartbeat": now,
         "heartbeat_epoch": time.time(),
     }
-    lock_file().write_text(json.dumps(info), encoding="utf-8")
+    # temp + replace: another PC never reads a half-written (empty) lock
+    tmp = lock_file().with_name(lock_file().name + ".tmp")
+    tmp.write_text(json.dumps(info), encoding="utf-8")
+    try:
+        os.replace(tmp, lock_file())
+    except OSError:
+        lock_file().write_text(json.dumps(info), encoding="utf-8")
+        tmp.unlink(missing_ok=True)
+
+
+def _unreadable_lock_is_stale() -> bool:
+    """An empty/half-synced lock file: treat it as held unless it has not
+    changed for LOCK_STALE_SECONDS."""
+    try:
+        return time.time() - lock_file().stat().st_mtime > LOCK_STALE_SECONDS
+    except OSError:
+        return True
 
 
 def acquire_lock() -> bool:
@@ -768,6 +795,8 @@ def acquire_lock() -> bool:
     if info is not None and not _lock_is_ours(info):
         if info and not _lock_is_stale(info):
             return False   # held by a live instance
+        if not info and not _unreadable_lock_is_stale():
+            return False   # unreadable (e.g. still syncing): assume held
         log.warning("Stale lock detected (%s) — auto-clearing.", info)
     try:
         _write_lock()
@@ -1006,6 +1035,7 @@ def normalise_activity(a: dict) -> dict:
             item[f] = ""
         else:
             item[f] = clean_text(item[f])
+    item["task_wp"] = normalise_wp(item["task_wp"])
     # "fabio  cialfi" (import, hand edit) is the users.txt "Fabio CIALFI"
     user = " ".join(item["user"].split())
     item["user"] = _canonical_users.get(user.casefold(), user)
@@ -1082,11 +1112,17 @@ def atomic_write_json(path: Path, obj) -> None:
     tmp  = path.with_name(path.name + ".tmp")
     try:
         tmp.write_text(text, encoding="utf-8")
-        os.replace(tmp, path)
-    except OSError as exc:
-        # e.g. OneDrive/antivirus holding the target — fall back to direct write
-        log.warning("atomic write failed for %s (%s) — writing directly", path, exc)
-        path.write_text(text, encoding="utf-8")
+        # OneDrive / antivirus may hold the target for a moment: retry
+        for attempt in range(6):
+            try:
+                os.replace(tmp, path)
+                return
+            except PermissionError as exc:
+                if attempt == 5:
+                    log.warning("atomic write failed for %s (%s) — writing directly", path, exc)
+                time.sleep(0.3)
+        path.write_text(text, encoding="utf-8")   # last resort; raises if still locked
+    finally:
         tmp.unlink(missing_ok=True)
 
 
@@ -1111,10 +1147,36 @@ def save_table_state(loaded_keys: set) -> None:
         log.warning("save_table_state failed: %s", exc)
 
 
+def loaded_key(a: dict) -> tuple:
+    """Identity of a loaded entry: the whole entry (activity_key), so that
+    two activities on the same day, user and task are told apart."""
+    return activity_key(a)
+
+
+def _canonical_state_key(k: tuple) -> tuple:
+    """Keys stored by older versions use the user spelling of that time and,
+    if they have 5 fields, are stable keys (date, user, type, WP, task)."""
+    if len(k) < 2:
+        return k
+    user = " ".join(k[1].split())
+    k = (k[0], _canonical_users.get(user.casefold(), user)) + tuple(k[2:])
+    try:
+        k = (safe_date(k[0]).isoformat(),) + k[1:]
+    except ValueError:
+        pass
+    return k
+
+
+def _is_loaded(a: dict, loaded_keys) -> bool:
+    # 7-field keys: the entry itself; 5-field keys (older state files): any
+    # entry with that date, user, type, WP and task
+    return loaded_key(a) in loaded_keys or _stable_key_fn(a) in loaded_keys
+
+
 def load_table_state() -> set:
     try:
         raw = json.loads(table_state_file().read_text(encoding="utf-8"))
-        return {tuple(str(x) for x in k) for k in raw.get("loaded_keys", [])}
+        return {_canonical_state_key(tuple(str(x) for x in k)) for k in raw.get("loaded_keys", [])}
     except FileNotFoundError:
         return set()
     except Exception as exc:
@@ -1141,7 +1203,7 @@ def merge_week(existing: list, entries: list, loaded_keys: set | frozenset = fro
     copies = Counter(activity_key(a) for a in entries)
     kept = []
     for a in existing:
-        if _stable_key_fn(a) in loaded_keys:
+        if _is_loaded(a, loaded_keys):
             continue
         k = activity_key(a)
         if copies[k] > 0:
@@ -1179,6 +1241,7 @@ def load_week_entries(year: int, cw: int) -> list:
         return normalise_data(json.loads(wf.read_text(encoding="utf-8")))
     except Exception as exc:
         log.warning("load_week_entries %s: %s", wf, exc)
+        skipped_archives.append(wf.name)
         return []
 
 
@@ -1259,7 +1322,7 @@ def reset_if_new_week(data: list) -> tuple[list, bool, Path | None]:
 
     current_from_archive += undated
     write_json(current_from_archive)
-    save_table_state({_stable_key_fn(a) for a in current_from_archive})
+    save_table_state({loaded_key(a) for a in current_from_archive})
     return current_from_archive, True, last_saved
 
 # Set when the data file could not be read — shown to the user by the App
@@ -1300,6 +1363,23 @@ def read_json() -> tuple[list, bool, Path | None]:
 skipped_archives: list[str] = []
 
 
+_ARCHIVE_NAME = re.compile(r"week_\d{4}_CW\d{2}\.json")
+
+
+def weekly_archive_files() -> list[Path]:
+    """The weekly archives. Other files matching week_*_CW*.json, such as
+    OneDrive conflict copies (week_2026_CW43-PCNAME.json), are not read
+    (they would count entries twice) but reported in skipped_archives."""
+    files = []
+    for path in sorted(weekly_dir().glob("week_*_CW*.json")):
+        if _ARCHIVE_NAME.fullmatch(path.name):
+            files.append(path)
+        else:
+            skipped_archives.append(f"{path.name} (not an archive name: conflict copy? "
+                                    f"merge it by hand, then delete it)")
+    return files
+
+
 def load_monthly_data_from_weekly_reports(year: int, month: int) -> list:
     return load_archived_entries(date(year, month, 1), last_day_of_month(year, month))
 
@@ -1312,7 +1392,7 @@ def load_archived_entries(month_start: date, month_end: date) -> list:
     wd = weekly_dir(); wd.mkdir(exist_ok=True)
     monthly_data: list = []
     seen: set = set()
-    for path in sorted(wd.glob("week_*_CW*.json")):
+    for path in weekly_archive_files():
         try:
             items = normalise_data(json.loads(path.read_text(encoding="utf-8")))
         except Exception as exc:
@@ -2700,7 +2780,7 @@ class NextWeekEditor(_FittedToplevel):
         # Same grouping as the weekly summary: by WP when tasks.txt has WPs
         wps = sorted({wp for _, _, wp in tasks if wp},
                      key=lambda w: (0 if w.upper().startswith("WP") else 1, w))
-        groups = wps or self.DEFAULT_GROUPS
+        groups = wps or configured_groups() or self.DEFAULT_GROUPS
         if wps:   # sections of older plans (by project) go into the WP tabs
             self._plan = regroup_plan(self._plan, wps, mark=True)
         self.PROJECTS = groups + [k for k in self._plan if k not in groups]
@@ -3612,7 +3692,7 @@ class App:
                 # Entries loaded in the previous session (incl. deleted ones
                 # whose deletion still has to reach the archive)
                 self._loaded_week_keys = (load_table_state()
-                                          | {_stable_key_fn(a) for a in self.data})
+                                          | {loaded_key(a) for a in self.data})
                 self._table_dirty_after_load()
                 # Set working week
                 if self.data:
@@ -3643,6 +3723,7 @@ class App:
             self.template_path = DEFAULT_TEMPLATE
 
         root.protocol("WM_DELETE_WINDOW", self.on_close)
+        root.report_callback_exception = self._report_callback_exception
 
         splash.set_status("Building interface…")
         self._build_menu()
@@ -3756,6 +3837,16 @@ class App:
     # Close / undo
     # -----------------------------------------------------------------------
 
+    def _report_callback_exception(self, exc_type, exc, tb) -> None:
+        """Unhandled error in a button/menu callback: the windowed exe has no
+        console, so log it and show it instead of failing silently."""
+        log.error("Unhandled error: %s", "".join(traceback.format_exception(exc_type, exc, tb)))
+        try:
+            messagebox.showerror("Unexpected error",
+                                 f"{exc_type.__name__}: {exc}\n\nDetails are in the log (Help → View log).")
+        except Exception:
+            pass
+
     def on_close(self) -> None:
         if getattr(self, "_generating", False):
             return   # monthly report being written: close once it is done
@@ -3829,7 +3920,18 @@ class App:
         """Write the table and the list of loaded entries to the share."""
         if read_only or not self._lock_still_ours():
             return   # viewing (e.g. Load week) still works, in memory only
-        write_json(self.data)
+        try:
+            write_json(self.data)
+        except OSError as exc:
+            log.error("_persist: %s", exc)
+            self._set_table_dirty()
+            messagebox.showerror(
+                "Not saved",
+                f"The table could not be written to the shared folder:\n{exc}\n\n"
+                "The file may be locked by OneDrive or another program. Your changes "
+                "are still in this window: wait a moment, then use Save week (or "
+                "make another change) to save again.")
+            return
         save_table_state(self._loaded_week_keys)
 
     def _push_undo(self, description: str) -> None:
@@ -4509,6 +4611,9 @@ class App:
                 seen.add(wp)
         # Sort: WP* first (WP6, WP7...), then others (SLM)
         wps = sorted(seen, key=lambda w: (0 if w.upper().startswith("WP") else 1, w))
+        # tasks.txt lines without a WP next to WP lines: selectable as "(no WP)"
+        if wps and any(not (e[2] if len(e) > 2 else "") for e in self.tasks):
+            wps.append(NO_WP)
         return wps
 
     def _populate_wp_cb(self, keep: bool = False) -> None:
@@ -4543,6 +4648,8 @@ class App:
     def _on_wp_changed(self, init: bool = False) -> None:
         """Filter task list to selected WP."""
         wp = self.wp_var.get()
+        if wp == NO_WP:
+            wp = ""
         filtered = []
         for entry in self.tasks:
             n, t = entry[0], entry[1]
@@ -4564,6 +4671,8 @@ class App:
         if a.get("entry_type") != "Activity":
             return
         wp = entry_wp(a)
+        if not wp and NO_WP in list(self.wp_cb["values"]):
+            wp = NO_WP
         if hasattr(self, "wp_var") and wp != self.wp_var.get():
             self.wp_var.set(wp)
             self._on_wp_changed()
@@ -4582,6 +4691,8 @@ class App:
         import re
         s  = self.task_var.get().strip()
         wp = self.wp_var.get().strip() if hasattr(self, "wp_var") else ""
+        if wp == NO_WP:
+            wp = ""
         # task_var now shows "N - Title" (WP is separate)
         m = re.match(r"^(\d+)\s*-\s*(.*)$", s)
         if m:
@@ -4956,7 +5067,7 @@ class App:
             self.data = loaded
             # Track which entries were present when week was loaded
             # so deletions are respected on Save week
-            self._loaded_week_keys = {_stable_key_fn(a) for a in loaded}
+            self._loaded_week_keys = {loaded_key(a) for a in loaded}
             self._new_entry_keys  = set()   # reset new entries tracker
             self._working_week = (year, cw)
             self._persist()
@@ -5019,7 +5130,7 @@ class App:
             self._mark_clean()
             self.data = merged
             self._working_week     = current_yw
-            self._loaded_week_keys = {_stable_key_fn(a) for a in self.data}
+            self._loaded_week_keys = {loaded_key(a) for a in self.data}
             self._new_entry_keys   = set()   # reset new entries tracker
 
             self._persist()
@@ -5100,7 +5211,7 @@ class App:
                 self.edit_index = None
                 self._mark_clean()
             # The archive now matches the table
-            self._loaded_week_keys = {_stable_key_fn(a) for a in self.data}
+            self._loaded_week_keys = {loaded_key(a) for a in self.data}
             self._persist()
             self.refresh()
         except Exception as e:
@@ -5153,7 +5264,7 @@ class App:
         self.data, was_reset, saved_file = read_json()
         if data_load_warning:
             messagebox.showwarning("Data file problem", data_load_warning)
-        self._loaded_week_keys = load_table_state() | {_stable_key_fn(a) for a in self.data}
+        self._loaded_week_keys = load_table_state() | {loaded_key(a) for a in self.data}
         self._table_dirty_after_load()
         if self.data:
             try:
@@ -5264,7 +5375,7 @@ class App:
             # Imported entries now count as loaded. Union, not reassignment:
             # rebuilding from self.data would forget entries deleted earlier
             # in this session, and Save week would bring them back.
-            self._loaded_week_keys |= {_stable_key_fn(a) for a in imported}
+            self._loaded_week_keys |= {loaded_key(a) for a in imported}
             self._persist()
             self._set_table_dirty()
             self.refresh()
@@ -5286,6 +5397,8 @@ class App:
     # -----------------------------------------------------------------------
 
     def open_next_week_editor(self) -> None:
+        if not require_io_dir():
+            return
         # Plan the week after the CW selected for the weekly summary
         try:
             base = (int(self.week_year.get()), int(self.cw_var.get()))
@@ -5299,6 +5412,8 @@ class App:
     # -----------------------------------------------------------------------
 
     def show_stats(self) -> None:
+        if not require_io_dir():
+            return
         try:
             y, m = map(int, self.month_var.get().strip().split("-"))
             if not (2000 <= y <= 2100):
@@ -5380,11 +5495,13 @@ class App:
             if writable and weeks:
                 self._undo_stack.clear()   # see save_current_week_button
             # Archived entries count as loaded, so later deletions reach the archive
-            self._loaded_week_keys |= {_stable_key_fn(a) for a in self.data}
+            self._loaded_week_keys |= {loaded_key(a) for a in self.data}
             self._persist()
             # ... then summarise the selected week from the archive, so it also
             # works for a week that is not loaded in the table
             nxt = week_after(year, cw)
+            global skipped_archives
+            skipped_archives = []
             week_data = merge_week(load_week_entries(year, cw) + load_week_entries(*nxt),
                                    normalise_data(self.data), self._loaded_week_keys)
             plan = load_next_week_plan(nxt)
@@ -5396,6 +5513,10 @@ class App:
             log.error("weekly: %s", e)
             messagebox.showerror("Generation error", str(e)); return
 
+        if skipped_archives:
+            messagebox.showwarning("Unreadable weekly files",
+                                   "These weekly files could not be read and are NOT included:\n\n"
+                                   + "\n".join(skipped_archives))
         win = tk.Toplevel(self.root)
         win.title(f"Weekly summary – CW{cw:02d}/{year}")
         win.geometry(f"820x{min(440, self.root.winfo_screenheight()-120)}")
