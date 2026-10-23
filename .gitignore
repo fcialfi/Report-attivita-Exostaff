@@ -19,3 +19,4 @@ weekly_reports/
 backups/
 logs/
 monthly_reports/
+.pytest_cache/
