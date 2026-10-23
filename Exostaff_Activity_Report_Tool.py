@@ -1281,11 +1281,15 @@ skipped_archives: list[str] = []
 
 
 def load_monthly_data_from_weekly_reports(year: int, month: int) -> list:
+    return load_archived_entries(date(year, month, 1), last_day_of_month(year, month))
+
+
+def load_archived_entries(month_start: date, month_end: date) -> list:
+    """Archived entries dated month_start..month_end (inclusive), each entry
+    once even if it was archived in more than one weekly file."""
     global skipped_archives
     skipped_archives = []
     wd = weekly_dir(); wd.mkdir(exist_ok=True)
-    month_start = date(year, month, 1)
-    month_end   = last_day_of_month(year, month)
     monthly_data: list = []
     seen: set = set()
     for path in sorted(wd.glob("week_*_CW*.json")):
@@ -1311,6 +1315,109 @@ def load_monthly_data_from_weekly_reports(year: int, month: int) -> list:
                 in_file.add(key)
         seen |= in_file
     return normalise_data(monthly_data)
+
+# ---------------------------------------------------------------------------
+# Effort per task over several months (statistics "Task trend")
+# ---------------------------------------------------------------------------
+
+def month_span(start: tuple[int, int], end: tuple[int, int]) -> list[tuple[int, int]]:
+    """[(year, month), ...] from start to end inclusive."""
+    out = []
+    y, m = start
+    while (y, m) <= tuple(end):
+        out.append((y, m))
+        y, m = (y + 1, 1) if m == 12 else (y, m + 1)
+    return out
+
+
+def trend_label(row: dict) -> str:
+    return f"{row['wp'] or '?'} T{row['task_no']}"
+
+
+def is_slm_wp(wp: str) -> bool:
+    return str(wp or "").strip().upper().startswith("SLM")
+
+
+def task_trend(entries: list, months: list[tuple[int, int]],
+               user: str = "", wp: str = "") -> list[dict]:
+    """Effort (PD) of each task per month: [{"wp", "task_no", "title",
+    "months": {(y, m): pd}, "total"}], sorted by WP then task number.
+    Activities only; SLM excluded; optional user / WP filter."""
+    wanted = set(months)
+    rows: dict[tuple, dict] = {}
+    for a in normalise_data(entries):
+        if a.get("entry_type") != "Activity" or (user and a.get("user") != user):
+            continue
+        try:
+            n = int(a.get("task_no", 0) or 0)
+            d = safe_date(a["date"])
+            pd = float(a.get("effort", 0) or 0)
+        except (TypeError, ValueError):
+            continue
+        a_wp = entry_wp(a)
+        ym = (d.year, d.month)
+        if n <= 0 or ym not in wanted or is_slm_wp(a_wp) or (wp and a_wp != wp):
+            continue
+        row = rows.setdefault((a_wp, n), {
+            "wp": a_wp, "task_no": n,
+            "title": _task_titles.get((n, a_wp)) or a.get("task_title", ""),
+            "months": defaultdict(float), "total": 0.0,
+        })
+        row["months"][ym] += pd
+        row["total"] += pd
+    return [rows[k] for k in sorted(rows, key=lambda k: (k[0] == "", k[0], k[1]))]
+
+
+def export_trend_xlsx(rows: list[dict], months: list[tuple[int, int]], out_path: str,
+                      title: str = "") -> None:
+    """Task x month table (PD) with totals and a stacked column chart."""
+    if not HAS_OPENPYXL:
+        raise RuntimeError("openpyxl is not installed. Run: pip install openpyxl")
+    from openpyxl.chart import BarChart, Reference
+    from openpyxl.chart.series import SeriesLabel
+    from openpyxl.chart.data_source import StrRef
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = "Task trend"
+    bold = Font(bold=True, name="Calibri", size=10)
+    head_fill = PatternFill("solid", fgColor="1E3A5F")
+    ws.append([title] if title else [])
+    ws["A1"].font = Font(bold=True, name="Calibri", size=12)
+    # the short "WP6 T9" label names each chart series; the title stays readable
+    header = ["Task", "Title"] + [month_label(date(y, m, 1)) for y, m in months] + ["Total"]
+    ws.append(header)
+    for c in ws[2]:
+        c.font = Font(bold=True, color="FFFFFF", name="Calibri", size=10)
+        c.fill = head_fill
+    for r in rows:
+        ws.append([trend_label(r), r["title"]]
+                  + [round(r["months"].get(ym, 0.0), 2) or None for ym in months]
+                  + [round(r["total"], 2)])
+    last = ws.max_row
+    ws.append(["TOTAL", ""]
+              + [round(sum(r["months"].get(ym, 0.0) for r in rows), 2) for ym in months]
+              + [round(sum(r["total"] for r in rows), 2)])
+    for c in ws[ws.max_row]:
+        c.font = bold
+    ws.column_dimensions["A"].width = 12
+    ws.column_dimensions["B"].width = 50
+    ws.freeze_panes = "C3"
+    if rows and months:
+        chart = BarChart()
+        chart.type, chart.grouping, chart.overlap = "col", "stacked", 100
+        chart.title = "Effort per task (PD)"
+        chart.y_axis.title = "PD"
+        chart.height, chart.width = 10, max(16, 2 * len(months))
+        # one series per task (row), months on the category axis
+        # series names come from column A, so the titles in B are skipped
+        for row in range(3, last + 1):
+            chart.add_data(Reference(ws, min_col=3, max_col=2 + len(months), min_row=row),
+                           from_rows=True, titles_from_data=False)
+            chart.series[-1].tx = SeriesLabel(strRef=StrRef(f"'Task trend'!$A${row}"))
+        chart.set_categories(Reference(ws, min_col=3, max_col=2 + len(months), min_row=2))
+        ws.add_chart(chart, f"A{ws.max_row + 3}")
+    wb.save(out_path)
+
 
 # ---------------------------------------------------------------------------
 # Auto-backup
@@ -2677,12 +2784,14 @@ class NextWeekEditor(_FittedToplevel):
 # ---------------------------------------------------------------------------
 
 class StatsWindow(_FittedToplevel):
-    def __init__(self, parent, data: list, year: int, month: int):
+    def __init__(self, parent, data: list, year: int, month: int, on_trend=None):
         super().__init__(parent)
         self.title(f"Statistics — {full_month_label(date(year, month, 1))}")
         self.resizable(True, True)
         self._fit_window(740, 540)
         self._build(data, year, month)
+        if on_trend:
+            ttk.Button(self, text="📈  Task trend over months…", command=on_trend).pack(pady=(0, 8))
 
     def _build(self, data, year, month):
         month_start = date(year, month, 1)
@@ -2878,6 +2987,252 @@ class StatsWindow(_FittedToplevel):
         tree.configure(yscroll=sb.set)
         tree.pack(side="left", fill="both", expand=True, padx=(10, 0), pady=10)
         sb.pack(side="right", fill="y", pady=10)
+
+# ---------------------------------------------------------------------------
+# Task trend window — effort per task over several months
+# ---------------------------------------------------------------------------
+
+def _blend(c1: str, c2: str, t: float) -> str:
+    """Colour between c1 (t=0) and c2 (t=1), both "#rrggbb"."""
+    a = [int(c1[i:i + 2], 16) for i in (1, 3, 5)]
+    b = [int(c2[i:i + 2], 16) for i in (1, 3, 5)]
+    return "#" + "".join(f"{round(x + (y - x) * t):02x}" for x, y in zip(a, b))
+
+
+class TrendWindow(_FittedToplevel):
+    """Task x month table coloured by effort, and a bar chart of the selected
+    task (or of all tasks) per month. `loader(start_date, end_date)` returns
+    the entries of the period (archives + current table)."""
+    ROW_H, MONTH_W, TOTAL_W = 22, 56, 62
+    WP_W, NO_W, TITLE_W = 46, 38, 270
+
+    def __init__(self, parent, loader, users: list[str], wps: list[str],
+                 start: tuple[int, int], end: tuple[int, int]):
+        super().__init__(parent)
+        self.title("Task trend — effort per month")
+        self.resizable(True, True)
+        self._fit_window(1180, 680)
+        self.configure(bg=BG_ROOT)
+        self._loader = loader
+        self._rows: list[dict] = []
+        self._months: list[tuple[int, int]] = []
+        self._selected: int | None = None
+        self._from = tk.StringVar(value=f"{start[0]}-{start[1]:02d}")
+        self._to   = tk.StringVar(value=f"{end[0]}-{end[1]:02d}")
+        self._user = tk.StringVar(value="All users")
+        self._wp   = tk.StringVar(value="All WPs")
+        self._build(users, [w for w in wps if not is_slm_wp(w)])
+        self._reload()
+
+    def _build(self, users, wps):
+        bar = ttk.Frame(self)
+        bar.pack(fill="x", padx=12, pady=(10, 4))
+        ttk.Label(bar, text="From").pack(side="left")
+        ttk.Entry(bar, textvariable=self._from, width=9).pack(side="left", padx=(4, 10))
+        ttk.Label(bar, text="To").pack(side="left")
+        ttk.Entry(bar, textvariable=self._to, width=9).pack(side="left", padx=(4, 10))
+        ttk.Combobox(bar, textvariable=self._user, values=["All users"] + list(users),
+                     width=22, state="readonly").pack(side="left", padx=4)
+        ttk.Combobox(bar, textvariable=self._wp, values=["All WPs"] + list(wps),
+                     width=10, state="readonly").pack(side="left", padx=4)
+        ttk.Button(bar, text="⟳  Update", command=self._reload).pack(side="left", padx=8)
+        ttk.Button(bar, text="⬇  Export to Excel", command=self._export).pack(side="right")
+        self._info = tk.Label(self, text="", font=("Segoe UI", 8), fg=FG_DIM, bg=BG_ROOT, anchor="w")
+        self._info.pack(fill="x", padx=12)
+
+        pane = ttk.PanedWindow(self, orient="vertical")
+        pane.pack(fill="both", expand=True, padx=12, pady=(4, 10))
+
+        top = ttk.Frame(pane)
+        self._grid = tk.Canvas(top, bg=BG_PANEL, highlightthickness=0)
+        ys = ttk.Scrollbar(top, orient="vertical", command=self._grid.yview)
+        xs = ttk.Scrollbar(top, orient="horizontal", command=self._grid.xview)
+        self._grid.configure(yscrollcommand=ys.set, xscrollcommand=xs.set)
+        self._grid.grid(row=0, column=0, sticky="nsew")
+        ys.grid(row=0, column=1, sticky="ns")
+        xs.grid(row=1, column=0, sticky="ew")
+        top.rowconfigure(0, weight=1); top.columnconfigure(0, weight=1)
+        self._grid.bind("<Button-1>", self._on_click)
+        self._grid.bind("<MouseWheel>",
+                        lambda e: self._grid.yview_scroll(int(-e.delta / 120), "units"))
+        pane.add(top, weight=3)
+
+        bottom = ttk.Frame(pane)
+        self._chart = tk.Canvas(bottom, bg=BG_PANEL, highlightthickness=0, height=200)
+        self._chart.pack(fill="both", expand=True)
+        self._chart.bind("<Configure>", lambda e: self._draw_chart())
+        pane.add(bottom, weight=2)
+
+    # ── data ─────────────────────────────────────────────────────────────
+    def _period(self) -> tuple[tuple[int, int], tuple[int, int]] | None:
+        try:
+            start = tuple(map(int, self._from.get().strip().split("-")))
+            end   = tuple(map(int, self._to.get().strip().split("-")))
+            for y, m in (start, end):
+                if not (2000 <= y <= 2100):
+                    raise ValueError
+                date(y, m, 1)
+        except Exception:
+            messagebox.showerror("Input error", "From and To must be YYYY-MM (e.g. 2026-01).", parent=self)
+            return None
+        if start > end:
+            start, end = end, start
+        if len(month_span(start, end)) > 36:
+            messagebox.showerror("Input error", "Choose a period of at most 36 months.", parent=self)
+            return None
+        return start, end
+
+    def _reload(self):
+        period = self._period()
+        if not period:
+            return
+        start, end = period
+        self._months = month_span(start, end)
+        try:
+            entries = self._loader(date(*start, 1), last_day_of_month(*end))
+        except Exception as exc:
+            log.error("task trend: %s", exc)
+            messagebox.showerror("Task trend", str(exc), parent=self)
+            return
+        user = "" if self._user.get() == "All users" else self._user.get()
+        wp   = "" if self._wp.get() == "All WPs" else self._wp.get()
+        self._rows = task_trend(entries, self._months, user=user, wp=wp)
+        self._selected = None
+        total = sum(r["total"] for r in self._rows)
+        note = ("  ·  unreadable archives not included: " + ", ".join(skipped_archives)
+                if skipped_archives else "")
+        self._info.configure(text=f"{len(self._rows)} tasks, {total:g} PD (SLM excluded). "
+                                  f"Click a task to see its trend below; click the header for all tasks.{note}")
+        self._draw_grid()
+        self._draw_chart()
+
+    # ── table ────────────────────────────────────────────────────────────
+    def _draw_grid(self):
+        c = self._grid
+        c.delete("all")
+        R, MW, TW = self.ROW_H, self.MONTH_W, self.TOTAL_W
+        x_months = self.WP_W + self.NO_W + self.TITLE_W
+        width = x_months + MW * len(self._months) + TW
+        peak = max([v for r in self._rows for v in r["months"].values()] or [1.0]) or 1.0
+        hdr_bg, hdr_fg = "#1c2b3a", "#e6edf3"
+        c.create_rectangle(0, 0, width, R, fill=hdr_bg, width=0)
+        for x, text in ((4, "WP"), (self.WP_W + 4, "Task"), (self.WP_W + self.NO_W + 4, "Title")):
+            c.create_text(x, R / 2, text=text, anchor="w", fill=hdr_fg, font=("Segoe UI", 9, "bold"))
+        for i, (y, m) in enumerate(self._months):
+            c.create_text(x_months + MW * i + MW / 2, R / 2, text=month_label(date(y, m, 1)),
+                          fill=hdr_fg, font=("Segoe UI", 8, "bold"))
+        c.create_text(width - TW / 2, R / 2, text="Total", fill=hdr_fg, font=("Segoe UI", 9, "bold"))
+
+        rows = self._rows + [None]   # None: totals row
+        for j, r in enumerate(rows):
+            y0 = R * (j + 1)
+            is_total = r is None
+            bg = "#dbeafe" if is_total and not DARK else (ROW_SEL if j == self._selected
+                                                           else ROW_ODD if j % 2 else ROW_EVEN)
+            c.create_rectangle(0, y0, width, y0 + R, fill=bg, width=0)
+            font = ("Segoe UI", 9, "bold") if is_total else ("Segoe UI", 9)
+            if is_total:
+                values = {ym: sum(x["months"].get(ym, 0.0) for x in self._rows) for ym in self._months}
+                total = sum(values.values())
+                c.create_text(self.WP_W + self.NO_W + 4, y0 + R / 2, text="TOTAL", anchor="w",
+                              fill=FG_MAIN, font=font)
+            else:
+                values, total = r["months"], r["total"]
+                c.create_text(4, y0 + R / 2, text=r["wp"] or "?", anchor="w", fill=FG_MAIN, font=font)
+                c.create_text(self.WP_W + 4, y0 + R / 2, text=str(r["task_no"]), anchor="w",
+                              fill=FG_MAIN, font=font)
+                title = r["title"] if len(r["title"]) <= 42 else r["title"][:40] + "…"
+                c.create_text(self.WP_W + self.NO_W + 4, y0 + R / 2, text=title, anchor="w",
+                              fill=FG_MAIN, font=font)
+            for i, ym in enumerate(self._months):
+                v = values.get(ym, 0.0)
+                if not v:
+                    continue
+                x0 = x_months + MW * i
+                if not is_total:
+                    t = min(v / peak, 1.0)
+                    c.create_rectangle(x0 + 1, y0 + 1, x0 + MW - 1, y0 + R - 1, width=0,
+                                       fill=_blend(BG_PANEL, ACCENT_DARK, 0.15 + 0.85 * t))
+                    fg = "#ffffff" if t > 0.5 else FG_MAIN
+                else:
+                    fg = FG_MAIN
+                c.create_text(x0 + MW / 2, y0 + R / 2, text=format_effort(v), fill=fg, font=font)
+            c.create_text(width - TW / 2, y0 + R / 2, text=format_effort(total), fill=FG_MAIN,
+                          font=("Segoe UI", 9, "bold"))
+        c.configure(scrollregion=(0, 0, width, R * (len(rows) + 1)))
+
+    def _on_click(self, event):
+        j = int(self._grid.canvasy(event.y) // self.ROW_H) - 1
+        self._selected = j if 0 <= j < len(self._rows) else None
+        self._draw_grid()
+        self._draw_chart()
+
+    # ── chart ────────────────────────────────────────────────────────────
+    def _draw_chart(self):
+        c = self._chart
+        c.delete("all")
+        w, h = max(c.winfo_width(), 200), max(c.winfo_height(), 120)
+        if not self._months:
+            return
+        if self._selected is not None:
+            r = self._rows[self._selected]
+            values = [r["months"].get(ym, 0.0) for ym in self._months]
+            title = f"{r['wp'] or '?'} task {r['task_no']} — {r['title']}"
+        else:
+            values = [sum(r["months"].get(ym, 0.0) for r in self._rows) for ym in self._months]
+            title = "All tasks"
+        if len(title) > 110:
+            title = title[:108] + "…"
+        c.create_text(10, 12, text=f"{title}  (PD per month)", anchor="w", fill=FG_MAIN,
+                      font=("Segoe UI", 9, "bold"))
+        left, right, top, bottom = 44, 12, 30, 24
+        # round gridline step (0.5, 1, 2, 5, 10 ... PD), about 4 lines
+        step = next((st for st in (0.5, 1, 2, 5, 10, 20, 50, 100, 200, 500, 1000)
+                     if max(values) / st <= 5), 2000)
+        peak = step * max(1, math.ceil(max(values) / step))
+        for k in range(int(round(peak / step)) + 1):
+            v = step * k
+            y = h - bottom - (h - top - bottom) * v / peak
+            c.create_line(left, y, w - right, y, fill=BORDER)
+            c.create_text(left - 6, y, text=format_effort(v), anchor="e", fill=FG_DIM,
+                          font=("Segoe UI", 7))
+        slot = (w - left - right) / len(values)
+        bw = max(min(slot * 0.65, 48), 2)
+        for i, v in enumerate(values):
+            x = left + slot * i + slot / 2
+            y = h - bottom - (h - top - bottom) * v / peak
+            if v:
+                c.create_rectangle(x - bw / 2, y, x + bw / 2, h - bottom, fill=ACCENT_DARK, width=0)
+                c.create_text(x, y - 7, text=format_effort(v), fill=FG_MAIN, font=("Segoe UI", 7))
+            y_, m_ = self._months[i]
+            c.create_text(x, h - bottom + 10, text=month_label(date(y_, m_, 1)), fill=FG_DIM,
+                          font=("Segoe UI", 7))
+
+    # ── export ───────────────────────────────────────────────────────────
+    def _export(self):
+        if not self._rows:
+            messagebox.showinfo("No data", "No effort in this period.", parent=self)
+            return
+        (y0, m0), (y1, m1) = self._months[0], self._months[-1]
+        out = filedialog.asksaveasfilename(
+            parent=self, defaultextension=".xlsx", filetypes=[("Excel files", "*.xlsx")],
+            initialfile=f"task_trend_{y0}-{m0:02d}_{y1}-{m1:02d}.xlsx")
+        if not out:
+            return
+        title = (f"Effort per task, {month_label(date(y0, m0, 1))} – {month_label(date(y1, m1, 1))}"
+                 + ("" if self._user.get() == "All users" else f" — {self._user.get()}")
+                 + ("" if self._wp.get() == "All WPs" else f" — {self._wp.get()}"))
+        try:
+            export_trend_xlsx(self._rows, self._months, out, title)
+        except PermissionError:
+            messagebox.showerror("Export error", f"{Path(out).name} is open in Excel: close it and retry.",
+                                 parent=self)
+            return
+        except Exception as exc:
+            log.error("export trend: %s", exc)
+            messagebox.showerror("Export error", str(exc), parent=self)
+            return
+        messagebox.showinfo("Exported", f"Saved:\n{out}", parent=self)
 
 # ---------------------------------------------------------------------------
 # Generating dialog — animated spinner shown during Word generation
@@ -3291,6 +3646,7 @@ class App:
         # View
         m_view = tk.Menu(menubar, tearoff=0)
         m_view.add_command(label="Monthly statistics…", command=self.show_stats)
+        m_view.add_command(label="Task trend…",         command=self.show_trend)
         m_view.add_command(label="Refresh\tF5",         command=self.refresh)
         menubar.add_cascade(label="View", menu=m_view)
 
@@ -4852,7 +5208,31 @@ class App:
             messagebox.showwarning("Unreadable weekly files",
                                    "These weekly files could not be read and are NOT included:\n\n"
                                    + "\n".join(skipped_archives))
-        StatsWindow(self.root, all_data, y, m)
+        StatsWindow(self.root, all_data, y, m, on_trend=self.show_trend)
+
+    def _entries_in_period(self, start: date, end: date) -> list:
+        """Archived entries of the period with the table's changes applied,
+        like the monthly statistics."""
+        table = []
+        for item in normalise_data(self.data):
+            try:
+                if start <= safe_date(item["date"]) <= end:
+                    table.append(item)
+            except Exception:
+                continue
+        return merge_week(load_archived_entries(start, end), table, self._loaded_week_keys)
+
+    def show_trend(self) -> None:
+        if not require_io_dir():
+            return
+        try:
+            y, m = map(int, self.month_var.get().strip().split("-"))
+            date(y, m, 1)
+        except Exception:
+            y, m = date.today().year, date.today().month
+        start = (y - 1, m + 1) if m < 12 else (y, 1)   # last 12 months up to the selected one
+        wps = sorted({wp for _, _, wp in self.tasks if wp})
+        TrendWindow(self.root, self._entries_in_period, self.users, wps, start, (y, m))
 
     def _table_entries_in_month(self, y: int, m: int) -> list:
         out = []
@@ -5362,6 +5742,12 @@ At the end of each month:
 The tool reads all weekly archives for that month from the
 Working folder and fills the Word template automatically.
 You can preview totals first via "📊 Statistics".
+
+Effort over several months: View → Task trend… (or the button
+at the bottom of the Statistics window). It shows a task × month
+table coloured by effort (SLM excluded), with a chart of the task
+you click (or of all tasks). Filter by period, user and WP, and
+use "Export to Excel" for the table with a ready-made chart.
 
 ──────────────────────────────────────────────────────────────
 5. TWO USAGE SCENARIOS
