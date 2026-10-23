@@ -19,6 +19,7 @@ Changes vs v3:
   - [NEW] Weekly email includes next-week plan when available
 """
 
+import io
 import json
 import math
 import csv
@@ -1236,6 +1237,10 @@ def reset_if_new_week(data: list) -> tuple[list, bool, Path | None]:
             )
         except Exception:
             pass
+    # Current-week entries deleted from the table but not yet saved
+    if any(_week_of_key(k) == current_yw for k in loaded):
+        write_week_archive(y, cw, [], loaded)
+        current_from_archive = merge_week(current_from_archive, [], loaded)
 
     current_from_archive += undated
     write_json(current_from_archive)
@@ -1363,7 +1368,7 @@ def task_trend(entries: list, months: list[tuple[int, int]],
             continue
         a_wp = entry_wp(a)
         ym = (d.year, d.month)
-        if n <= 0 or ym not in wanted or is_slm_wp(a_wp) or (wp and a_wp != wp):
+        if n <= 0 or pd <= 0 or ym not in wanted or is_slm_wp(a_wp) or (wp and a_wp != wp):
             continue
         row = rows.setdefault((a_wp, n), {
             "wp": a_wp, "task_no": n,
@@ -1920,7 +1925,8 @@ def regroup_plan(plan: dict[str, list[str]], groups: list[str],
         if key in groups or not items:
             continue
         wps = {wp for (_, wp), proj in _project_map.items() if proj == key and wp in groups}
-        target = wps.pop() if len(wps) == 1 else groups[0]
+        fallback = next((g for g in groups if not is_slm_wp(g)), groups[0])
+        target = wps.pop() if len(wps) == 1 else fallback
         moved = ([f"# from {key} (older plan): check the WP"] if mark else []) + list(items)
         out.setdefault(target, []).extend(moved)
     return out
@@ -2081,9 +2087,13 @@ def generate_monthly_docx(template_path, data: list, year: int, month: int, out_
         et = a.get("entry_type", "Activity")
         if et == "Activity":
             task_no = int(a.get("task_no", 0) or 0)
-            task_wp = a.get("task_wp", "")
+            # WP recovered for entries archived before the WP column existed,
+            # so WP6 T1 and SLM T1 of the same user are not lumped together
+            task_wp = entry_wp(a)
+            a["task_wp"] = task_wp
             if task_no > 0:
-                activities_by_user_task[(a.get("user", ""), task_no, task_wp)].append(a)
+                key = (a.get("user", ""), task_no, task_wp, _norm_title(a.get("task_title", "")))
+                activities_by_user_task[key].append(a)
             else:
                 unmapped.append(f"{a.get('user', '')}: {a.get('date', '')} activity without task "
                                 f"({format_effort(a.get('effort', 0))} PD)")
@@ -2092,9 +2102,9 @@ def generate_monthly_docx(template_path, data: list, year: int, month: int, out_
             leave_by_user[a.get("user", "")] += float(a.get("effort", 0) or 0)
         # Other entry_types silently ignored
     # Users with activity but no table in the template: their effort would vanish
-    for u in sorted({u for (u, _, _) in activities_by_user_task} - set(template_users)):
+    for u in sorted({k[0] for k in activities_by_user_task} - set(template_users)):
         pd = sum(float(a.get("effort", 0) or 0)
-                 for (uu, _, _), acts in activities_by_user_task.items() if uu == u for a in acts)
+                 for (uu, *_), acts in activities_by_user_task.items() if uu == u for a in acts)
         unmapped.append(f"{u or '(no user)'}: {format_effort(pd)} PD — user not in template")
     for u in sorted(set(leave_by_user) - set(template_users)):
         if leave_by_user[u]:
@@ -2102,7 +2112,7 @@ def generate_monthly_docx(template_path, data: list, year: int, month: int, out_
                             "— user not in template")
     # Pre-compute total effort per user (summing across all tasks and WPs)
     effort_by_user: dict[str, float] = {}
-    for (u, tn, wp), acts in activities_by_user_task.items():
+    for (u, *_), acts in activities_by_user_task.items():
         effort_by_user[u] = effort_by_user.get(u, 0.0) + sum(
             float(a.get("effort", 0) or 0) for a in acts
         )
@@ -2134,7 +2144,7 @@ def generate_monthly_docx(template_path, data: list, year: int, month: int, out_
         # Assign every entry of this user to exactly ONE template row, so that
         # effort can never be counted twice (or silently dropped).
         acts_by_row: dict[int, list] = defaultdict(list)
-        for (u, n, wp), entries in activities_by_user_task.items():
+        for (u, n, wp, _), entries in activities_by_user_task.items():
             if u != user:
                 continue
             row_idx = _match_template_row(entries[0], task_rows, table_wp)
@@ -2328,7 +2338,8 @@ def import_activity_table(path: str | Path) -> tuple[list, list[str]]:
     if path.suffix.lower() == ".json":
         return _validate_imported(normalise_data(json.loads(path.read_text(encoding="utf-8"))))
     rows: list = []
-    with open(path, "r", newline="", encoding="utf-8-sig") as f:
+    # UTF-8 (own exports) or Windows ANSI (a CSV re-saved by Excel)
+    with io.StringIO(read_config_text(path), newline="") as f:
         # decide on the header line only: descriptions are full of commas
         header = f.readline(); f.seek(0)
         delimiter = ";" if header.count(";") >= header.count(",") else ","
@@ -3243,7 +3254,7 @@ class TrendWindow(_FittedToplevel):
 
     # ── export ───────────────────────────────────────────────────────────
     def _export(self):
-        if not self._rows:
+        if not self._rows or not self._months:
             messagebox.showinfo("No data", "No effort in this period.", parent=self)
             return
         (y0, m0), (y1, m1) = self._months[0], self._months[-1]
@@ -3796,11 +3807,25 @@ class App:
         if len(self._undo_stack) > 20:
             self._undo_stack.pop(0)
 
+    def _end_edit(self, action: str) -> bool:
+        """Before an action that rebuilds the table: an entry being edited
+        would otherwise be saved as a new duplicate later. False = cancelled."""
+        if self.edit_index is None:
+            return True
+        if self._form_dirty() and not messagebox.askyesno(
+                "Unsaved changes",
+                f"The entry being edited has unsaved changes.\n{action} will discard them. Continue?"):
+            return False
+        self.cancel_edit(clear_desc=True)
+        return True
+
     def undo(self) -> None:
-        if not self._writable():
+        if not require_io_dir() or not self._writable():
             return
         if not self._undo_stack:
             self._status("Nothing to undo.")
+            return
+        if not self._end_edit("Undo"):
             return
         entry = self._undo_stack.pop()
         desc, snapshot = entry[0], entry[1]
@@ -4456,6 +4481,11 @@ class App:
         edited is not silently moved to the first task on Save."""
         wps = self._get_wps()
         self.wp_cb["values"] = wps
+        if (keep and self.edit_index is not None and self.edit_index < len(self.data)
+                and wps and self.wp_var.get() not in wps):
+            # the edited entry's WP was renamed/removed: keep its own task
+            self._update_wp_and_task_from_entry(self.data[self.edit_index])
+            return
         if keep and self.task_var.get() and (self.wp_var.get() in wps or not wps):
             current = self.task_var.get()
             self._on_wp_changed()          # refreshes the list, keeps a valid task
@@ -4771,7 +4801,7 @@ class App:
 
     def delete_selected(self) -> None:
         idx = self.selected_index()
-        if idx is None or not self._writable():
+        if idx is None or not require_io_dir() or not self._writable():
             return
         if messagebox.askyesno("Delete", "Delete selected entry?"):
             self._push_undo("delete entry")
@@ -4960,7 +4990,7 @@ class App:
             self.refresh()
             self.week_year.set(str(y))
             self.cw_var.set(str(cw))
-            self._clear_table_dirty()
+            self._table_dirty_after_load()   # merged in-progress entries are still unsaved
 
             if self.data:
                 self._status(f"Current week loaded — CW{cw:02d}/{y}, {len(self.data)} entries")
@@ -4972,6 +5002,8 @@ class App:
 
     def save_current_week_button(self) -> None:
         if not self._writable() or not self._lock_still_ours():
+            return
+        if not self._end_edit("Save week"):
             return
         try:
             # Group table entries by calendar week
@@ -5168,7 +5200,7 @@ class App:
             messagebox.showerror("Export error", str(e))
 
     def import_table(self) -> None:
-        if not self._writable():
+        if not require_io_dir() or not self._writable():
             return
         path = filedialog.askopenfilename(
             title="Import from another user",
@@ -6084,7 +6116,7 @@ will show the new version number on next launch.
                             f"Reopen it from:\n{d}",
                             parent=win,
                         )
-                        self._shutdown()
+                        self.on_close()   # asks first if the form has unsaved text
                     self.root.after(0, _finish)
                 elif not ok:
                     self.root.after(0, lambda: [
