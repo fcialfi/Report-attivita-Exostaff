@@ -30,7 +30,7 @@ import socket
 import time
 import logging
 import traceback
-from collections import defaultdict
+from collections import Counter, defaultdict
 from datetime import date, datetime, timedelta
 from pathlib import Path
 import zipfile
@@ -554,6 +554,7 @@ def load_tasks_from_config() -> tuple[list[tuple], dict[tuple, str], dict[tuple,
 
 
 # Global config state — loaded once IO folder is set
+_canonical_users: dict[str, str]        = {}   # casefolded name -> users.txt spelling
 _project_map:    dict[tuple, str]       = {}
 _initials_map:   dict[tuple, list[str]] = {}
 _wp_map:         dict[tuple, str]       = {}
@@ -563,9 +564,10 @@ _task_titles:    dict[tuple, str]       = {}   # (task_no, wp) -> title
 
 def reload_config() -> tuple[list[str], list[tuple]]:
     """Reload users and tasks from config files. Updates global maps."""
-    global _project_map, _initials_map, _wp_map, _users_initials, _task_titles
+    global _project_map, _initials_map, _wp_map, _users_initials, _task_titles, _canonical_users
     create_default_config()
     users = load_users_from_config()
+    _canonical_users = {" ".join(u.split()).casefold(): u for u in users}
     tasks, _project_map, _initials_map, _wp_map = load_tasks_from_config()
     _task_titles = {(n, wp): t for n, t, wp in tasks}
     # Build user->initials map from users.txt names
@@ -1004,6 +1006,9 @@ def normalise_activity(a: dict) -> dict:
             item[f] = ""
         else:
             item[f] = clean_text(item[f])
+    # "fabio  cialfi" (import, hand edit) is the users.txt "Fabio CIALFI"
+    user = " ".join(item["user"].split())
+    item["user"] = _canonical_users.get(user.casefold(), user)
     if item.get("entry_type") is None:
         item.pop("entry_type", None)
     if "effort" not in item:
@@ -1126,13 +1131,23 @@ def _week_of_key(key: tuple) -> tuple[int, int] | None:
 
 def merge_week(existing: list, entries: list, loaded_keys: set | frozenset = frozenset()) -> list:
     """Archive content of one week after saving the table's entries for it:
-    - table versions replace archived entries with the same key;
-    - archived entries that were loaded into the table but are no longer
-      there were deleted (or edited into another key/date) and are dropped;
-    - everything else (e.g. other users' entries) is kept."""
-    table = {_stable_key_fn(a) for a in entries}
-    kept = [a for a in existing
-            if _stable_key_fn(a) not in table and _stable_key_fn(a) not in loaded_keys]
+    - archived entries that were loaded into the table are replaced by the
+      table's versions (or dropped: deleted, or edited into another date);
+    - an archived entry identical to a table entry is not kept twice;
+    - everything else (other users' entries, entries never loaded) is kept."""
+    # An archived entry that was never loaded is a different activity even
+    # when it shares date, user and task with a table entry (2 x 0.5 PD on
+    # the same task is normal): only an exact copy of a table entry goes.
+    copies = Counter(activity_key(a) for a in entries)
+    kept = []
+    for a in existing:
+        if _stable_key_fn(a) in loaded_keys:
+            continue
+        k = activity_key(a)
+        if copies[k] > 0:
+            copies[k] -= 1
+            continue
+        kept.append(a)
     return kept + list(entries)
 
 
@@ -1933,10 +1948,8 @@ def regroup_plan(plan: dict[str, list[str]], groups: list[str],
 
 
 def save_next_week_plan(plan: dict[str, list[str]], target: tuple[int, int]) -> None:
-    try:
-        atomic_write_json(next_week_file(), {"target_week": list(target), "plan": plan})
-    except Exception as exc:
-        log.warning("save_next_week_plan failed: %s", exc)
+    """Raises on failure: the caller tells the user."""
+    atomic_write_json(next_week_file(), {"target_week": list(target), "plan": plan})
 
 # ---------------------------------------------------------------------------
 # Weekly text generation (with optional next-week plan override)
@@ -2303,7 +2316,9 @@ def export_to_xlsx(data: list, out_path: str) -> None:
     # Totals row
     total_row = len(data_norm) + 2
     ws.cell(row=total_row, column=5, value="TOTAL").font = Font(bold=True, name="Calibri", size=10)
-    total_effort = sum(float(a.get("effort", 0) or 0) for a in data_norm)
+    # activities only, like "Summary by User" (leave is not effort)
+    total_effort = sum(float(a.get("effort", 0) or 0) for a in data_norm
+                       if a.get("entry_type") == "Activity")
     tc = ws.cell(row=total_row, column=6, value=total_effort)
     tc.font   = Font(bold=True, name="Calibri", size=10)
     tc.fill   = PatternFill("solid", fgColor="D6E4F0")
@@ -2740,7 +2755,8 @@ class NextWeekEditor(_FittedToplevel):
                      width=14, state="readonly").grid(row=0, column=1, padx=4, pady=4)
 
         ttk.Label(qa_frame, text="Task").grid(row=0, column=2, padx=6)
-        task_vals = [f"{(wp+' - ') if wp else ''}{n} - {t}" for n, t, wp in self.tasks]
+        self._qa_titles = {f"{(wp+' - ') if wp else ''}{n} - {t}": (t, wp) for n, t, wp in self.tasks}
+        task_vals = list(self._qa_titles)
         ttk.Combobox(qa_frame, textvariable=self._qa_task, values=task_vals,
                      width=40, state="readonly").grid(row=0, column=3, padx=4)
 
@@ -2761,6 +2777,11 @@ class NextWeekEditor(_FittedToplevel):
     def _quick_add(self):
         desc    = self._qa_desc.get().strip()
         project = self._qa_project.get()
+        title, task_wp = self._qa_titles.get(self._qa_task.get(), ("", ""))
+        if not desc:
+            desc = title   # task chosen without a description: its title
+            if task_wp in self._texts:
+                project = task_wp
         if not desc:
             return
         txt = self._texts.get(project)
@@ -2788,7 +2809,12 @@ class NextWeekEditor(_FittedToplevel):
             messagebox.showwarning("Read-only", READ_ONLY_MSG, parent=self)
             return
         plan = self._collect()
-        save_next_week_plan(plan, self._target)
+        try:
+            save_next_week_plan(plan, self._target)
+        except Exception as exc:
+            log.warning("save_next_week_plan failed: %s", exc)
+            messagebox.showerror("Save error", f"The plan could not be saved:\n{exc}", parent=self)
+            return
         messagebox.showinfo("Saved", f"Plan for CW{self._target[1]:02d}/{self._target[0]} saved.",
                             parent=self)
 
@@ -2856,8 +2882,16 @@ class StatsWindow(_FittedToplevel):
         # Total capacity = working_days × n_users
         capacity     = working_days * n_users
 
-        # Leave days (per user, summed across all users)
-        leave_effort = sum(float(a.get("effort", 0) or 0) for a in leave_entries)
+        # Leave days (per user, summed across all users). Leave logged on a
+        # weekend or public holiday is not taken from the capacity, which
+        # already excludes those days.
+        def _working_day(a):
+            try:
+                d = safe_date(a.get("date", ""))
+            except ValueError:
+                return False
+            return d.weekday() < 5 and d not in month_holidays
+        leave_effort = sum(float(a.get("effort", 0) or 0) for a in leave_entries if _working_day(a))
 
         # Expected effort = capacity - leave
         expected     = capacity - leave_effort
@@ -2901,7 +2935,7 @@ class StatsWindow(_FittedToplevel):
               col=2)
         _cell(panel, "Leave (PD)",
               f"{leave_effort:g}",
-              tip="Holiday + Sick Leave days logged",
+              tip="Holiday + Sick Leave days logged on working days",
               col=3)
         _cell(panel, "Effort logged (PD)",
               f"{total_effort:g}",
@@ -3723,6 +3757,8 @@ class App:
     # -----------------------------------------------------------------------
 
     def on_close(self) -> None:
+        if getattr(self, "_generating", False):
+            return   # monthly report being written: close once it is done
         if self._form_dirty():
             if not messagebox.askyesno(
                 "Unsaved changes",
@@ -4100,7 +4136,7 @@ class App:
         desc_row.grid(row=3, column=0, columnspan=8, sticky="we", pady=(4, 0))
         desc_row.columnconfigure(1, weight=1)
         ttk.Label(desc_row, text="Description").grid(row=0, column=0, sticky="nw", padx=(0, 6))
-        self.desc = tk.Text(desc_row, height=4, font=("Segoe UI", 9), wrap="word",
+        self.desc = tk.Text(desc_row, height=4, font=("Segoe UI", 9), wrap="word", undo=True,
                             bg=BG_ENTRY, fg=FG_MAIN)
         self.desc.grid(row=0, column=1, sticky="we")
 
@@ -4825,7 +4861,7 @@ class App:
     # -----------------------------------------------------------------------
 
     def reset_data(self) -> None:
-        if not require_io_dir() or not self._writable():
+        if not require_io_dir() or not self._writable() or not self._end_edit("Reset"):
             return
         if not messagebox.askyesno(
             "Reset",
@@ -4866,7 +4902,7 @@ class App:
 
     def load_week_into_table(self) -> None:
         """Load a specific CW from the weekly archive into the table for editing."""
-        if not require_io_dir():
+        if not require_io_dir() or not self._end_edit("Loading the week"):
             return
         try:
             year = int(self.week_year.get())
@@ -4933,7 +4969,7 @@ class App:
 
     def load_current_week(self) -> None:
         """Load current week — same logic as load_week_into_table but for today."""
-        if not require_io_dir():
+        if not require_io_dir() or not self._end_edit("Loading the week"):
             return
         if self._table_dirty:
             if not messagebox.askyesno(
@@ -4975,7 +5011,7 @@ class App:
                     log.warning("load_current_week: %s", exc)
 
             # Merge: in-progress entries replace their archived versions
-            merged = normalise_data(merge_entries(from_archive, from_current))
+            merged = normalise_data(merge_week(from_archive, from_current, self._loaded_week_keys))
             merged.sort(key=lambda a: str(a.get("date", "")))
 
             self._push_undo("load current week")
@@ -5200,7 +5236,7 @@ class App:
             messagebox.showerror("Export error", str(e))
 
     def import_table(self) -> None:
-        if not require_io_dir() or not self._writable():
+        if not require_io_dir() or not self._writable() or not self._end_edit("Import"):
             return
         path = filedialog.askopenfilename(
             title="Import from another user",
@@ -5214,14 +5250,17 @@ class App:
             for item in imported:   # files from older versions carry no WP
                 if not item.get("task_wp"):
                     item["task_wp"] = entry_wp(item)
-            existing_keys = {activity_key(a) for a in self.data}
+            # Copies already in the table are skipped one for one, so two
+            # identical entries in the file (2 x 0.5 PD) both arrive
+            existing = Counter(activity_key(a) for a in self.data)
             added = skipped = 0
             self._push_undo("import")
             for item in imported:
                 key = activity_key(item)
-                if key in existing_keys:
+                if existing[key] > 0:
+                    existing[key] -= 1
                     skipped += 1; continue
-                self.data.append(item); existing_keys.add(key); added += 1
+                self.data.append(item); added += 1
             # Imported entries now count as loaded. Union, not reassignment:
             # rebuilding from self.data would forget entries deleted earlier
             # in this session, and Save week would bring them back.
@@ -5346,8 +5385,8 @@ class App:
             # ... then summarise the selected week from the archive, so it also
             # works for a week that is not loaded in the table
             nxt = week_after(year, cw)
-            week_data = merge_entries(load_week_entries(year, cw) + load_week_entries(*nxt),
-                                      normalise_data(self.data))
+            week_data = merge_week(load_week_entries(year, cw) + load_week_entries(*nxt),
+                                   normalise_data(self.data), self._loaded_week_keys)
             plan = load_next_week_plan(nxt)
             txt  = generate_weekly_text(
                 week_data, start.isoformat(), end.isoformat(),
@@ -5494,9 +5533,14 @@ class App:
                 self.root.after(0, dlg.close)
 
         t = threading.Thread(target=_run, daemon=True)
-        t.start()
-        self.root.wait_window(dlg)
-        t.join(timeout=120)
+        # closing the window now would destroy Tk under the worker thread
+        self._generating = True
+        try:
+            t.start()
+            self.root.wait_window(dlg)
+            t.join(timeout=120)
+        finally:
+            self._generating = False
 
         try:
             if result.get("error"):
@@ -5982,7 +6026,8 @@ will show the new version number on next launch.
         """Refresh user and task dropdowns from current self.users/self.tasks."""
         if hasattr(self, "user_cb"):
             self.user_cb["values"] = self.users
-            if self.users and self.user_var.get() not in self.users:
+            # an entry being edited keeps its user even if not in users.txt
+            if self.users and self.user_var.get() not in self.users and self.edit_index is None:
                 self.user_var.set(
                     self.last_user if self.last_user in self.users else self.users[0]
                 )
@@ -6000,7 +6045,7 @@ will show the new version number on next launch.
             if hasattr(self, "user_cb"):
                 self.user_cb["values"] = self.users
                 cur = self.user_var.get()
-                if self.users and cur not in self.users:
+                if self.users and cur not in self.users and self.edit_index is None:
                     self.user_var.set(self.last_user if self.last_user in self.users else self.users[0])
             # Update WP and task comboboxes
             if hasattr(self, "wp_cb"):
