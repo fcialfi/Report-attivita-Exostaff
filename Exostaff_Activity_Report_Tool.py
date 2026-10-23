@@ -1330,6 +1330,13 @@ def month_span(start: tuple[int, int], end: tuple[int, int]) -> list[tuple[int, 
     return out
 
 
+def trim_empty_months(rows: list[dict], months: list[tuple[int, int]]) -> list[tuple[int, int]]:
+    """`months` without the leading and trailing months that have no effort
+    (empty months in between stay: they show a gap)."""
+    used = [i for i, ym in enumerate(months) if any(r["months"].get(ym) for r in rows)]
+    return months[used[0]:used[-1] + 1] if used else []
+
+
 def trend_label(row: dict) -> str:
     return f"{row['wp'] or '?'} T{row['task_no']}"
 
@@ -3102,6 +3109,7 @@ class TrendWindow(_FittedToplevel):
         user = "" if self._user.get() == "All users" else self._user.get()
         wp   = "" if self._wp.get() == "All WPs" else self._wp.get()
         self._rows = task_trend(entries, self._months, user=user, wp=wp)
+        self._months = trim_empty_months(self._rows, self._months)
         self._selected = None
         total = sum(r["total"] for r in self._rows)
         note = ("  ·  unreadable archives not included: " + ", ".join(skipped_archives)
