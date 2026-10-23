@@ -18,5 +18,10 @@ xvfb-run -a pytest          # headless Linux
 - `test_reports.py` — monthly Word report on the real template, weekly
   summary, task trend, next-week plan.
 - `test_lock.py` — the single-user lock between two PCs.
+- `test_regressions.py` — identical copies of an entry, multi-week writes
+  interrupted by an error.
+- `test_model_random.py` — random sequences of user actions over days and
+  sessions checked against a model of which entries must exist (20 short
+  sequences in CI; `MBT_SEEDS=300 MBT_STEPS=60` for a long run).
 
 Every bug fixed in the tool gets a test here, so it cannot come back.
