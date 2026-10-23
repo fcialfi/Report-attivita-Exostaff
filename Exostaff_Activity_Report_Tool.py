@@ -212,7 +212,7 @@ def check_version() -> tuple[str, bool]:
         if d is None:
             log.warning("check_version: VERSION.txt not found in %s", _release_dirs())
             return APP_VERSION, False
-        latest = (d / "VERSION.txt").read_text(encoding="utf-8").strip()
+        latest = (d / "VERSION.txt").read_text(encoding="utf-8-sig").strip()
         if not latest:
             log.warning("check_version: VERSION.txt is empty in %s", d)
             return APP_VERSION, False
@@ -800,10 +800,12 @@ def acquire_lock() -> bool:
         log.warning("Stale lock detected (%s) — auto-clearing.", info)
     try:
         _write_lock()
-        return True
     except Exception as exc:
         log.warning("acquire_lock write failed: %s", exc)
         return True   # on error, let the user through
+    # Two PCs starting together both write: the last writer wins, so check
+    time.sleep(1.0)
+    return _lock_is_ours(_read_lock()) or _read_lock() is None
 
 
 def refresh_lock() -> bool:
@@ -1148,9 +1150,9 @@ def save_table_state(loaded_keys: set) -> None:
 
 
 def loaded_key(a: dict) -> tuple:
-    """Identity of a loaded entry: the whole entry (activity_key), so that
-    two activities on the same day, user and task are told apart."""
-    return activity_key(a)
+    """Identity of a loaded entry: the whole entry (activity_key) plus its WP,
+    so that two activities on the same day, user and task are told apart."""
+    return activity_key(a) + (normalise_wp(a.get("task_wp") or entry_wp(a)),)
 
 
 def _canonical_state_key(k: tuple) -> tuple:
@@ -1168,9 +1170,11 @@ def _canonical_state_key(k: tuple) -> tuple:
 
 
 def _is_loaded(a: dict, loaded_keys) -> bool:
-    # 7-field keys: the entry itself; 5-field keys (older state files): any
-    # entry with that date, user, type, WP and task
-    return loaded_key(a) in loaded_keys or _stable_key_fn(a) in loaded_keys
+    # 8-field keys: the entry itself; 7-field (previous version): the entry
+    # without WP; 5-field (older state files): any entry with that date,
+    # user, type, WP and task
+    return (loaded_key(a) in loaded_keys or activity_key(a) in loaded_keys
+            or _stable_key_fn(a) in loaded_keys)
 
 
 def load_table_state() -> set:
@@ -1195,22 +1199,11 @@ def merge_week(existing: list, entries: list, loaded_keys: set | frozenset = fro
     """Archive content of one week after saving the table's entries for it:
     - archived entries that were loaded into the table are replaced by the
       table's versions (or dropped: deleted, or edited into another date);
-    - an archived entry identical to a table entry is not kept twice;
     - everything else (other users' entries, entries never loaded) is kept."""
-    # An archived entry that was never loaded is a different activity even
-    # when it shares date, user and task with a table entry (2 x 0.5 PD on
-    # the same task is normal): only an exact copy of a table entry goes.
-    copies = Counter(activity_key(a) for a in entries)
-    kept = []
-    for a in existing:
-        if _is_loaded(a, loaded_keys):
-            continue
-        k = activity_key(a)
-        if copies[k] > 0:
-            copies[k] -= 1
-            continue
-        kept.append(a)
-    return kept + list(entries)
+    # An archived entry that was never loaded is a different activity, even
+    # when identical to a table entry (a second 0.5 PD "Meetings" the same
+    # day): it is kept. Re-imported copies are filtered out by import_table.
+    return [a for a in existing if not _is_loaded(a, loaded_keys)] + list(entries)
 
 
 def write_week_archive(year: int, cw: int, entries: list,
@@ -1537,6 +1530,8 @@ def auto_backup(data: list, force: bool = False) -> None:
     Triggers every SAVE_BACKUP_EVERY saves, on first save of session, or when forced.
     """
     global _save_counter
+    if read_only:
+        return
     _save_counter += 1
     # Always backup on first save of session or when forced
     if not force and _save_counter > 1 and _save_counter % SAVE_BACKUP_EVERY != 0:
@@ -1662,6 +1657,12 @@ def valid_effort(v: float) -> bool:
     """A real person-day value: finite, > 0 and not absurd ("nan", "inf"
     and "1e3" are accepted by float())."""
     return math.isfinite(v) and 0 < v <= 100
+
+
+def round_pd(value: float) -> float:
+    """Effort rounded to 0.01 PD the way format_effort displays it (half up)."""
+    from decimal import Decimal, ROUND_HALF_UP
+    return float(Decimal(str(round(float(value), 10))).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP))
 
 
 def format_effort(value) -> str:
@@ -2252,7 +2253,8 @@ def generate_monthly_docx(template_path, data: list, year: int, month: int, out_
             c0 = r.cells[0].text.strip()
             if c0.isdigit():
                 acts    = acts_by_row.get(idx, [])
-                effort  = sum(float(a.get("effort", 0) or 0) for a in acts)
+                # rounded as displayed, so the rows add up to the totals
+                effort  = round_pd(sum(float(a.get("effort", 0) or 0) for a in acts))
                 total_effort += effort
                 set_cell_text(r.cells[2], format_effort(effort))
                 if idx + 1 < len(rows):
@@ -2309,11 +2311,13 @@ def generate_monthly_docx(template_path, data: list, year: int, month: int, out_
                     continue
                 matched = _match_user_by_initials(code)
                 if matched:
-                    val = user_efforts[matched]; total += val
+                    val = round_pd(user_efforts[matched]); total += val
                     set_cell_text(row.cells[2], format_effort(val))
                 else:
                     log.warning("No user match for initials code: %r — available: %s",
                                 code, [initials_for_user(u) for u in user_efforts])
+                    set_cell_text(row.cells[2], "0")   # never leave the template's number
+                    unmapped.append(f"Effort summary: code {code!r} matches no user — set to 0")
             for row in table.rows:
                 if row.cells[0].text.strip().upper() == "TOTAL":
                     set_cell_text(row.cells[2], format_effort(total))
@@ -2326,8 +2330,11 @@ def generate_monthly_docx(template_path, data: list, year: int, month: int, out_
                     continue
                 matched = _match_user_by_initials(code)
                 if matched:
-                    val = leave_by_user.get(matched, 0.0); total_abs += val
+                    val = round_pd(leave_by_user.get(matched, 0.0)); total_abs += val
                     set_cell_text(row.cells[2], format_effort(val))
+                else:
+                    set_cell_text(row.cells[2], "0")
+                    unmapped.append(f"Absence summary: code {code!r} matches no user — set to 0")
             for row in table.rows:
                 if row.cells[0].text.strip().upper() == "TOTAL":
                     set_cell_text(row.cells[2], format_effort(total_abs))
@@ -2769,9 +2776,10 @@ class _FittedToplevel(tk.Toplevel):
 class NextWeekEditor(_FittedToplevel):
     DEFAULT_GROUPS = ["EPS-Sterna", "EPS-Aeolus", "Common"]
 
-    def __init__(self, parent, tasks: list[tuple], target: tuple[int, int]):
+    def __init__(self, parent, tasks: list[tuple], target: tuple[int, int], can_write=None):
         super().__init__(parent)
         self.title("Next Week — Planned Activities")
+        self._can_write = can_write or (lambda: True)
         self.resizable(True, True)
         self._fit_window(780, 560)
         self.tasks   = tasks
@@ -2885,7 +2893,7 @@ class NextWeekEditor(_FittedToplevel):
         return plan
 
     def _save(self):
-        if read_only:
+        if read_only or not self._can_write():
             messagebox.showwarning("Read-only", READ_ONLY_MSG, parent=self)
             return
         plan = self._collect()
@@ -5130,7 +5138,12 @@ class App:
             self._mark_clean()
             self.data = merged
             self._working_week     = current_yw
-            self._loaded_week_keys = {loaded_key(a) for a in self.data}
+            # archived entries edited or deleted in the table must stay
+            # "loaded", or Save week would keep their old versions
+            self._loaded_week_keys = ({loaded_key(a) for a in from_archive}
+                                      | {loaded_key(a) for a in self.data}
+                                      | {k for k in self._loaded_week_keys
+                                         if _week_of_key(k) == current_yw})
             self._new_entry_keys   = set()   # reset new entries tracker
 
             self._persist()
@@ -5361,21 +5374,29 @@ class App:
             for item in imported:   # files from older versions carry no WP
                 if not item.get("task_wp"):
                     item["task_wp"] = entry_wp(item)
-            # Copies already in the table are skipped one for one, so two
-            # identical entries in the file (2 x 0.5 PD) both arrive
-            existing = Counter(activity_key(a) for a in self.data)
+            # Copies already in the table or in the archive are skipped one
+            # for one, so two identical entries in the file (2 x 0.5 PD) both
+            # arrive and a re-import adds nothing
+            existing = Counter(loaded_key(a) for a in self.data)
+            weeks = set()
+            for item in imported:
+                try:
+                    weeks.add(iso_year_week_for_date(safe_date(item["date"])))
+                except ValueError:
+                    pass
+            for wk in weeks:
+                existing.update(loaded_key(a) for a in load_week_entries(*wk)
+                                if not _is_loaded(a, self._loaded_week_keys))
             added = skipped = 0
             self._push_undo("import")
             for item in imported:
-                key = activity_key(item)
+                key = loaded_key(item)
                 if existing[key] > 0:
                     existing[key] -= 1
                     skipped += 1; continue
                 self.data.append(item); added += 1
-            # Imported entries now count as loaded. Union, not reassignment:
-            # rebuilding from self.data would forget entries deleted earlier
-            # in this session, and Save week would bring them back.
-            self._loaded_week_keys |= {loaded_key(a) for a in imported}
+            # Imported rows are new entries, not loaded from the archive:
+            # deleting one again must not touch archived entries
             self._persist()
             self._set_table_dirty()
             self.refresh()
@@ -5405,7 +5426,7 @@ class App:
             iso_week_monday(*base)
         except (ValueError, TypeError):
             base = iso_year_week_for_date(date.today())
-        NextWeekEditor(self.root, self.tasks, week_after(*base))
+        NextWeekEditor(self.root, self.tasks, week_after(*base), can_write=self._lock_still_ours)
 
     # -----------------------------------------------------------------------
     # Statistics
@@ -5633,8 +5654,10 @@ class App:
                 _doc = _Doc(self.template_path)
                 _template_users = [u for u, _ in get_user_tables(_doc)]
                 _config_users   = load_users_from_config()
-                _missing_tpl    = [u for u in _config_users if u not in _template_users]
-                _missing_cfg    = [u for u in _template_users if u not in _config_users]
+                _same = lambda u: " ".join(u.split()).casefold()   # as matched in the report
+                _tpl_set, _cfg_set = {_same(u) for u in _template_users}, {_same(u) for u in _config_users}
+                _missing_tpl    = [u for u in _config_users if _same(u) not in _tpl_set]
+                _missing_cfg    = [u for u in _template_users if _same(u) not in _cfg_set]
                 _warn = []
                 if _missing_tpl:
                     _warn.append(f"In config but missing in template:\n  {', '.join(_missing_tpl)}")
@@ -6126,7 +6149,7 @@ will show the new version number on next launch.
         btn_frame.pack(fill="x", pady=6)
 
         def save_and_reload():
-            if read_only:
+            if read_only or not self._lock_still_ours():
                 messagebox.showwarning("Read-only", READ_ONLY_MSG, parent=win)
                 return
             try:
@@ -6257,6 +6280,11 @@ will show the new version number on next launch.
         btn_frame.pack()
 
         def do_update():
+            if self._form_dirty() and not messagebox.askyesno(
+                    "Unsaved changes",
+                    "The form has unsaved changes. The application closes after the "
+                    "update and they will be lost.\n\nUpdate anyway?", parent=win):
+                return
             btn_update.configure(state="disabled")
             btn_later.configure(state="disabled")
             status_var.set("Downloading… please wait.")
@@ -6282,7 +6310,7 @@ will show the new version number on next launch.
                             f"Reopen it from:\n{d}",
                             parent=win,
                         )
-                        self.on_close()   # asks first if the form has unsaved text
+                        self._shutdown()   # unsaved form already confirmed in do_update
                     self.root.after(0, _finish)
                 elif not ok:
                     self.root.after(0, lambda: [
