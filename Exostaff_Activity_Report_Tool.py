@@ -1198,8 +1198,25 @@ def startup_loaded_keys(data: list) -> Counter:
     """Loaded entries at start: the saved state; without one (very old
     versions) every table entry counts as loaded."""
     if table_state_file().exists():
-        return load_table_state()
+        return load_table_state() | archived_in_table(data)
     return loaded_counter(data)
+
+
+def archived_in_table(data: list) -> Counter:
+    """Table entries already in their weekly archive, one count per copy found
+    in both. The state file can be older than the table (OneDrive synced one
+    file and not yet the other, or its write failed): without this, Save week
+    and the week-change archive wrote every archived entry a second time."""
+    groups: dict[tuple, list] = {}
+    for a in data:
+        try:
+            groups.setdefault(iso_year_week_for_date(safe_date(a["date"])), []).append(a)
+        except (ValueError, KeyError):
+            pass
+    found = Counter()
+    for (y, cw), entries in groups.items():
+        found |= loaded_counter(entries) & loaded_counter(load_week_entries(y, cw))
+    return found
 
 
 def forget_week(loaded_keys, week: tuple[int, int]) -> Counter:
@@ -1296,7 +1313,7 @@ def save_weekly_archive(data: list, ref_date: date | None = None,
 def reset_if_new_week(data: list) -> tuple[list, bool, Path | None]:
     """Auto-archive past weeks. Groups by week so each lands in its own file."""
     data = normalise_data(data)
-    loaded = load_table_state()
+    loaded = startup_loaded_keys(data)
     today = date.today()
     current_yw = iso_year_week_for_date(today)
 
@@ -3835,6 +3852,7 @@ class App:
         # Edit
         m_edit = tk.Menu(menubar, tearoff=0)
         m_edit.add_command(label="Next-week plan…",  command=self.open_next_week_editor)
+        m_edit.add_command(label="Remove duplicate entries…", command=self.remove_duplicates)
         m_edit.add_separator()
         m_edit.add_command(label="Edit users…",       command=self.open_users_config)
         m_edit.add_command(label="Edit tasks…",       command=self.open_tasks_config)
@@ -5006,6 +5024,46 @@ class App:
             self._set_table_dirty()
             self.refresh()
             self._status("Entry deleted.")
+
+    def remove_duplicates(self) -> None:
+        """Keep one copy of entries that appear more than once, identical in
+        every field (archives duplicated by an older version). Load the week
+        first, then Save week writes the cleaned table to the archive."""
+        if not require_io_dir() or not self._writable() or not self._end_edit("Remove duplicates"):
+            return
+        counts = Counter(loaded_key(a) for a in self.data)
+        dups = {k: n for k, n in counts.items() if n > 1}
+        if not dups:
+            messagebox.showinfo("Remove duplicates",
+                                "No duplicate entries in the table.\n\n"
+                                "To clean an archived week, load it first (Load CW).")
+            return
+        extra = sum(n - 1 for n in dups.values())
+        lines = [f"{k[0]}  {k[1]}  {k[5]} PD  ×{n}  {k[6][:40]}"
+                 for k, n in sorted(dups.items())]
+        if not messagebox.askyesno(
+                "Remove duplicates",
+                f"{extra} extra copies will be removed, one copy of each is kept:\n\n"
+                + "\n".join(lines[:20]) + ("\n…" if len(lines) > 20 else "")
+                + "\n\nTwo genuine identical entries (e.g. 2 × 0.5 PD Meetings the same "
+                  "day) are merged too: add the second one again afterwards.\n\nContinue?"):
+            return
+        self._push_undo("remove duplicates")
+        seen: Counter = Counter()
+        kept = []
+        for a in self.data:
+            k = loaded_key(a)
+            seen[k] += 1
+            if seen[k] == 1:
+                kept.append(a)
+        self.data = kept
+        self.edit_index = None
+        self._pending_duplicate_idx = None
+        self._mark_clean()
+        self._persist()
+        self._set_table_dirty()
+        self.refresh()
+        self._status(f"{extra} duplicate entries removed — click 💾 Save week to update the archive.")
 
     # -----------------------------------------------------------------------
     # Archive / reset
