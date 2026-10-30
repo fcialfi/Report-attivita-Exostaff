@@ -15,8 +15,9 @@ xvfb-run -a pytest          # headless Linux
   (week change, forgotten entries, past-week edits, import, undo, year
   boundary, read-only). Invariant: a saved entry is archived exactly once and
   a deleted one never comes back.
-- `test_reports.py` — monthly Word report on the real template, weekly
-  summary, task trend, next-week plan.
+- `test_reports.py` — monthly Word report on the real template (including
+  the report parameters of the cover page), weekly summary, task trend,
+  next-week plan.
 - `test_lock.py` — the single-user lock between two PCs.
 - `test_regressions.py` — identical copies of an entry, multi-week writes
   interrupted by an error, a state file older than the table (OneDrive)

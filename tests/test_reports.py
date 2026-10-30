@@ -130,3 +130,35 @@ def test_task_trend_and_export(tool, tmp_path):
     ws = openpyxl.load_workbook(out).active
     assert ws.cell(ws.max_row, 1).value == "TOTAL" and ws.cell(ws.max_row, 6).value == 3.5
     assert len(ws._charts) == 1
+
+
+def test_report_parameters_applied(real_config, tmp_path):
+    T = real_config
+    assert T.template_report_params(TEMPLATE) == {
+        "Contract": "EUM/CO/24/4600002812/AC", "Purchase Order": "4500027747", "WP": "06",
+        "Service Level Manager": "", "EUM Technical Officer": "Alessio Canestri"}
+    T.save_report_params({"EUM Technical Officer": "Mario Rossi", "Service Level Manager": "Anna Bianchi",
+                          "Contract": "EUM/CO/26/1234567890/XY", "Purchase Order": "4500099999",
+                          "WP": "07"})
+    (T.share / "config" / "report_params.txt").write_text(
+        (T.share / "config" / "report_params.txt").read_text(encoding="utf-8")
+        .replace("WP = 07", "wp=07"), encoding="utf-8")   # hand edit: case and spacing
+    out = tmp_path / "r.docx"
+    T.generate_monthly_docx(TEMPLATE, [entry("2026-09-01", "x", user="Fabio CIALFI")], 2026, 9, str(out))
+    assert T.template_report_params(out) == {
+        "Contract": "EUM/CO/26/1234567890/XY", "Purchase Order": "4500099999", "WP": "07",
+        "Service Level Manager": "Anna Bianchi", "EUM Technical Officer": "Mario Rossi"}
+    import zipfile
+    with zipfile.ZipFile(out) as z:
+        text = "".join(z.read(n).decode("utf-8", "ignore") for n in z.namelist() if n.endswith(".xml"))
+    assert "4600002812" not in text and "4500027747" not in text   # footer, intro, properties
+
+
+def test_report_parameters_empty_keeps_template(real_config, tmp_path):
+    T = real_config
+    T.save_report_params({"EUM Technical Officer": "Mario Rossi"})
+    out = tmp_path / "r.docx"
+    T.generate_monthly_docx(TEMPLATE, [], 2026, 9, str(out))
+    got = T.template_report_params(out)
+    assert got["EUM Technical Officer"] == "Mario Rossi"
+    assert got["Contract"] == "EUM/CO/24/4600002812/AC" and got["WP"] == "06"
