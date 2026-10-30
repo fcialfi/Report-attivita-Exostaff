@@ -156,3 +156,12 @@ def test_statistics_see_unsaved_changes(session, tool, monkeypatch):
     monkeypatch.setattr(tool.StatsWindow, "__init__", lambda self, p, data, y, m, **k: got.append(data))
     s.app.month_var.set("2026-10"); s.app.show_stats()
     assert sorted((x["description"], x["effort"]) for x in got[0]) == [("a", 0.5), ("c", 0.25)]
+
+
+def test_report_parameters_dialog_saves(session, tool):
+    s = session(date(2026, 10, 19))
+    s.app.open_report_params()
+    dlg = next(w for w in s.root.winfo_children() if isinstance(w, tool.ReportParamsDialog))
+    dlg._vars["EUM Technical Officer"].set("  Mario Rossi ")
+    dlg._save()
+    assert tool.load_report_params() == {"EUM Technical Officer": "Mario Rossi"}

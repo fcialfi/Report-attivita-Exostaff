@@ -339,6 +339,10 @@ def holidays_file() -> Path:
     return config_dir() / "holidays.txt"
 
 
+def report_params_file() -> Path:
+    return config_dir() / "report_params.txt"
+
+
 HOLIDAYS_TEMPLATE = """# EUMETSAT Public Holidays
 # Format: YYYY-MM-DD | Description
 # Lines starting with # are comments
@@ -1949,6 +1953,158 @@ def patch_month_and_date_in_docx_file(docx_path, year: int, month: int) -> None:
     shutil.move(str(tmp), str(docx_path))
 
 # ---------------------------------------------------------------------------
+# Monthly report parameters (config/report_params.txt): cover-page values
+# that change over the contract, e.g. a new EUM Technical Officer
+# ---------------------------------------------------------------------------
+
+# (name in report_params.txt, label of its cover-table row, document property)
+REPORT_PARAMS: list[tuple[str, str, str]] = [
+    ("Contract",              "Contract number:",       "Contract"),
+    ("Purchase Order",        "Purchase Order:",        "PO"),
+    ("WP",                    "WP:",                    "WP"),
+    ("Service Level Manager", "Service Level Manager:", ""),
+    ("EUM Technical Officer", "EUM Technical Officer:", ""),
+]
+
+REPORT_PARAMS_HEADER = """# Monthly report parameters (Edit > Report parameters...)
+# Format: Name = value
+# An empty value keeps the text of the Word template.
+"""
+
+
+def load_report_params() -> dict[str, str]:
+    """The non-empty values of report_params.txt, by parameter name."""
+    path = report_params_file()
+    if not path.exists():
+        return {}
+    names = {n.casefold(): n for n, _, _ in REPORT_PARAMS}
+    params = {}
+    for line in read_config_text(path).splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, value = (x.strip() for x in line.split("=", 1))
+        if key.casefold() in names and value:
+            params[names[key.casefold()]] = clean_text(value)
+    return params
+
+
+def save_report_params(params: dict[str, str]) -> None:
+    if read_only:
+        raise PermissionError(READ_ONLY_MSG)
+    lines = [f"{n} = {' '.join(params.get(n, '').split())}" for n, _, _ in REPORT_PARAMS]
+    config_dir().mkdir(exist_ok=True)
+    report_params_file().write_text(REPORT_PARAMS_HEADER + "\n".join(lines) + "\n", encoding="utf-8")
+
+
+def _doc_properties(docx_path) -> dict[str, str]:
+    """Custom document properties of a .docx (Contract, PO, WP, ...)."""
+    with zipfile.ZipFile(docx_path) as z:
+        if "docProps/custom.xml" not in z.namelist():
+            return {}
+        root = etree.fromstring(z.read("docProps/custom.xml"))
+    out = {}
+    for prop in root:
+        vals = [v.text or "" for v in prop if isinstance(v.tag, str)]
+        out[prop.get("name", "")] = vals[0] if vals else ""
+    return out
+
+
+def _label_cells(doc, label: str) -> list:
+    """Value cells of the cover-table rows whose first cell is `label`."""
+    cells = []
+    for table in iter_all_tables(doc):
+        for row in table.rows:
+            first, last = row.cells[0], row.cells[-1]
+            if first.text.strip() == label and last._tc is not first._tc:
+                cells.append(last)
+    return cells
+
+
+def template_report_params(template_path) -> dict[str, str]:
+    """Values the template has now, shown as hints in the parameters dialog."""
+    out = {}
+    try:
+        props = _doc_properties(template_path)
+        doc = Document(str(template_path))
+    except Exception as exc:
+        log.warning("template_report_params: %s", exc)
+        return out
+    for name, label, prop in REPORT_PARAMS:
+        if prop:
+            out[name] = props.get(prop, "")
+        else:
+            cells = _label_cells(doc, label)
+            out[name] = cells[0].text.strip() if cells else ""
+    return out
+
+
+def patch_report_params_in_docx_file(docx_path, params: dict[str, str]) -> None:
+    """Values held in document properties (Contract, PO, WP): the property,
+    the DOCPROPERTY fields showing it, and its old text where it is long
+    enough to be unambiguous (a contract number, not "06")."""
+    docx_path = Path(docx_path)
+    by_prop = {prop: params[name] for name, _, prop in REPORT_PARAMS if prop and params.get(name)}
+    if not by_prop:
+        return
+    old_props = _doc_properties(docx_path)
+    replacements = {old_props[p]: v for p, v in by_prop.items()
+                    if len(old_props.get(p, "")) >= 6 and old_props[p] != v}
+    field = re.compile(r"DOCPROPERTY\s+\"?([^\"\\]+?)\"?\s")
+    ns = {"w": "http://schemas.openxmlformats.org/wordprocessingml/2006/main"}
+
+    def patch_xml(data: bytes) -> bytes:
+        root = etree.fromstring(data, parser=etree.XMLParser(remove_blank_text=False, recover=True))
+        for elem in root.iter():
+            if isinstance(elem.tag, str) and elem.text:
+                for old, new in replacements.items():
+                    elem.text = elem.text.replace(old, new)
+        for prop in root.xpath("//*[local-name()='property']"):
+            if prop.get("name") in by_prop:
+                for v in prop:
+                    if isinstance(v.tag, str):
+                        v.text = by_prop[prop.get("name")]
+        for fld in root.xpath("//w:fldSimple", namespaces=ns):
+            m = field.search(fld.get(qn("w:instr"), "") + " ")
+            if m and m.group(1).strip() in by_prop:
+                texts = fld.xpath(".//w:t", namespaces=ns)
+                if texts:
+                    texts[0].text = by_prop[m.group(1).strip()]
+                    for t in texts[1:]: t.text = ""
+        return etree.tostring(root, xml_declaration=True, encoding="UTF-8", standalone=False)
+
+    tmp = docx_path.with_suffix(".tmp.docx")
+    with zipfile.ZipFile(docx_path, "r") as zin, zipfile.ZipFile(tmp, "w", zipfile.ZIP_DEFLATED) as zout:
+        for item in zin.infolist():
+            data = zin.read(item.filename)
+            if item.filename.endswith(".xml") and item.filename.startswith(("word/", "docProps/")):
+                data = patch_xml(data)
+            zout.writestr(item, data)
+    shutil.move(str(tmp), str(docx_path))
+
+
+def apply_report_params_to_doc(doc, params: dict[str, str]) -> None:
+    """Values typed in cover-table cells (EUM Technical Officer, Service Level
+    Manager): the cell keeps its font, only the text changes."""
+    import copy
+    for name, label, prop in REPORT_PARAMS:
+        if prop or not params.get(name):
+            continue
+        for cell in _label_cells(doc, label):
+            para = cell.paragraphs[0]
+            if para.runs:
+                para.runs[0].text = params[name]
+                for run in para.runs[1:]:
+                    run.text = ""
+            else:
+                run = para.add_run(params[name])
+                mark = para._p.find(qn("w:pPr") + "/" + qn("w:rPr"))
+                if mark is not None:   # font of the empty cell's paragraph mark
+                    run._r.insert(0, copy.deepcopy(mark))
+            for extra in cell.paragraphs[1:]:
+                extra._p.getparent().remove(extra._p)
+
+# ---------------------------------------------------------------------------
 # Report generation helpers
 # ---------------------------------------------------------------------------
 
@@ -2194,7 +2350,10 @@ def generate_monthly_docx(template_path, data: list, year: int, month: int, out_
         patched = Path(td) / "template.docx"
         shutil.copy2(template_path, patched)
         patch_month_and_date_in_docx_file(patched, year, month)
+        params = load_report_params()
+        patch_report_params_in_docx_file(patched, params)
         doc = Document(str(patched))
+        apply_report_params_to_doc(doc, params)
     month_start = date(year, month, 1)
     month_end   = last_day_of_month(year, month)
     user_tables = get_user_tables(doc)
@@ -2962,6 +3121,61 @@ class NextWeekEditor(_FittedToplevel):
         if messagebox.askyesno("Clear", "Clear all planned activities?", parent=self):
             for txt in self._texts.values():
                 txt.delete("1.0", "end")
+
+# ---------------------------------------------------------------------------
+# Monthly report parameters dialog
+# ---------------------------------------------------------------------------
+
+class ReportParamsDialog(_FittedToplevel):
+    """Edit config/report_params.txt: cover-page values of the monthly report."""
+
+    def __init__(self, parent, template_path, can_write=None):
+        super().__init__(parent)
+        self.title("Monthly report parameters")
+        self._can_write = can_write or (lambda: True)
+        self.resizable(True, False)
+        saved = load_report_params()
+        in_template = template_report_params(template_path) if template_path else {}
+        self._vars: dict[str, tk.StringVar] = {}
+        self.configure(bg=BG_PANEL)
+
+        ttk.Label(self, text="Values written on the cover page of the monthly Word report",
+                  font=("Segoe UI", 10, "bold")).pack(pady=(14, 2), padx=14)
+        ttk.Label(self, text="Leave a field empty to keep the text of the template.\n"
+                             "Saved for everybody in config/report_params.txt.",
+                  font=("Segoe UI", 8), foreground=FG_DIM, justify="center").pack(padx=14)
+
+        form = ttk.Frame(self)
+        form.pack(fill="x", padx=14, pady=10)
+        form.columnconfigure(1, weight=1)
+        for i, (name, _, _) in enumerate(REPORT_PARAMS):
+            ttk.Label(form, text=name).grid(row=2 * i, column=0, sticky="w", padx=(0, 8), pady=(6, 0))
+            var = tk.StringVar(value=saved.get(name, ""))
+            ttk.Entry(form, textvariable=var, width=44).grid(row=2 * i, column=1, sticky="we", pady=(6, 0))
+            self._vars[name] = var
+            ttk.Label(form, text=f"Template: {in_template.get(name) or '(empty)'}",
+                      font=("Segoe UI", 8), foreground=FG_DIM).grid(row=2 * i + 1, column=1, sticky="w")
+
+        btns = ttk.Frame(self)
+        btns.pack(pady=(4, 12))
+        ttk.Button(btns, text="💾  Save", command=self._save,
+                   style="Accent.TButton", width=12).grid(row=0, column=0, padx=8)
+        ttk.Button(btns, text="✖  Cancel", command=self.destroy, width=12).grid(row=0, column=1, padx=8)
+        self.update_idletasks()
+        self._fit_window(max(560, self.winfo_reqwidth()), self.winfo_reqheight())
+        self.grab_set()
+
+    def _save(self):
+        if read_only or not self._can_write():
+            messagebox.showwarning("Read-only", READ_ONLY_MSG, parent=self)
+            return
+        try:
+            save_report_params({n: v.get().strip() for n, v in self._vars.items()})
+        except Exception as exc:
+            log.warning("save_report_params failed: %s", exc)
+            messagebox.showerror("Save error", f"The parameters could not be saved:\n{exc}", parent=self)
+            return
+        self.destroy()
 
 # ---------------------------------------------------------------------------
 # Monthly statistics window
@@ -3853,6 +4067,7 @@ class App:
         m_edit = tk.Menu(menubar, tearoff=0)
         m_edit.add_command(label="Next-week plan…",  command=self.open_next_week_editor)
         m_edit.add_command(label="Remove duplicate entries…", command=self.remove_duplicates)
+        m_edit.add_command(label="Report parameters…", command=self.open_report_params)
         m_edit.add_separator()
         m_edit.add_command(label="Edit users…",       command=self.open_users_config)
         m_edit.add_command(label="Edit tasks…",       command=self.open_tasks_config)
@@ -4436,6 +4651,11 @@ class App:
         btn_weekly = ttk.Button(bottom, text="📋  Generate weekly summary", command=self.weekly)
         btn_weekly.grid(row=0, column=4, padx=(0, 4))
         add_tooltip(btn_weekly, "Generate weekly summary text. Uses next-week plan if saved.")
+
+        btn_params = ttk.Button(bottom, text="⚙  Report parameters", command=self.open_report_params)
+        btn_params.grid(row=0, column=5, columnspan=2, sticky="we", padx=(0, 4))
+        add_tooltip(btn_params, "Cover-page values of the monthly report: contract, purchase order, "
+                                "WP, Service Level Manager, EUM Technical Officer.")
 
         # ── Row 1: Monthly controls + Export/Import + Exit ───────────────────
         ttk.Label(bottom, text="Month YYYY-MM").grid(row=1, column=0, columnspan=1, sticky="w", pady=(4, 0))
@@ -6092,6 +6312,11 @@ The tool reads all weekly archives for that month from the
 Working folder and fills the Word template automatically.
 You can preview totals first via "📊 Statistics".
 
+Cover-page values (contract, purchase order, WP, Service Level
+Manager, EUM Technical Officer) are set with "⚙ Report parameters"
+(also Edit > Report parameters…). They are saved for everybody in
+config/report_params.txt; an empty field keeps the template's text.
+
 Effort over several months: View → Task trend… (or the button
 at the bottom of the Statistics window). It shows a task × month
 table coloured by effort (SLM excluded), with a chart of the task
@@ -6301,6 +6526,11 @@ will show the new version number on next launch.
                 "Dropdowns updated.")
         except Exception as e:
             messagebox.showerror("Config error", str(e))
+
+    def open_report_params(self) -> None:
+        if not require_io_dir():
+            return
+        ReportParamsDialog(self.root, self.template_path, can_write=self._lock_still_ours)
 
     def open_users_config(self) -> None:
         if not require_io_dir():
