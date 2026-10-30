@@ -19,7 +19,8 @@ xvfb-run -a pytest          # headless Linux
   summary, task trend, next-week plan.
 - `test_lock.py` — the single-user lock between two PCs.
 - `test_regressions.py` — identical copies of an entry, multi-week writes
-  interrupted by an error.
+  interrupted by an error, a state file older than the table (OneDrive)
+  and the clean-up of an archive with duplicated entries.
 - `test_model_random.py` — random sequences of user actions over days and
   sessions checked against a model of which entries must exist (20 short
   sequences in CI; `MBT_SEEDS=300 MBT_STEPS=60` for a long run).

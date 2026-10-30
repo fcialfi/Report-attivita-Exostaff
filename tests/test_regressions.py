@@ -64,3 +64,56 @@ def test_partial_auto_archive_duplicates(session, tool):
     bad.unlink()
     s = session(NEXT_MON); s.close()      # retry
     assert archives(tool)["week_2026_CW42"] == ["B"]
+
+
+def _stale_state(tool, keys):
+    """The state file as another PC left it, or as OneDrive synced it late."""
+    tool.save_table_state(keys)
+
+
+def test_stale_state_save_week_duplicates(session, tool):
+    # The table is synced, its state file is not (OneDrive, failed write):
+    # Save week must not write the already archived entries a second time
+    s = session(MON)
+    s.add(MON, "A"); s.add(MON, "B", user="Bob B"); s.save_week(); s.close()
+    _stale_state(tool, [])
+    s = session(MON + timedelta(days=1))
+    s.add(MON + timedelta(days=1), "C"); s.save_week()
+    assert archives(tool)["week_2026_CW43"] == ["A", "B", "C"]
+
+
+def test_stale_state_auto_archive_duplicates(session, tool):
+    s = session(MON)
+    s.add(MON, "A"); s.save_week(); s.close()
+    _stale_state(tool, [])
+    s = session(NEXT_MON); s.close()      # week change: CW43 auto-archived
+    assert archives(tool)["week_2026_CW43"] == ["A"]
+
+
+def test_stale_state_keeps_new_identical_copy(session, tool):
+    # A second identical half-day added to the table is still a new entry
+    s = session(MON)
+    s.add(MON, "Meetings"); s.save_week()
+    s.add(MON, "Meetings"); s.close()
+    _stale_state(tool, [])
+    s = session(MON)
+    s.save_week()
+    assert archives(tool)["week_2026_CW43"] == ["Meetings"] * 2
+
+
+def test_remove_duplicates_cleans_archived_week(session, tool):
+    # Archive duplicated by the version above: load the week, remove the
+    # duplicates, Save week
+    s = session(MON)
+    s.add(MON, "A"); s.add(MON, "B", user="Bob B"); s.save_week(); s.close()
+    _stale_state(tool, [])
+    s = session(MON)
+    s.app._loaded_week_keys = tool.Counter()   # the old behaviour: nothing loaded
+    s.save_week(); s.close()
+    assert archives(tool)["week_2026_CW43"] == ["A", "A", "B", "B"]
+    s = session(MON)
+    s.load_week(2026, 43)
+    s.app.remove_duplicates()
+    assert s.table() == ["A", "B"]
+    s.save_week()
+    assert archives(tool)["week_2026_CW43"] == ["A", "B"]
