@@ -327,3 +327,22 @@ def test_build_info_read_at_start(tmp_path):
     out = subprocess.run([sys.executable, "-c", "import tool; print(tool.APP_VERSION, tool.RELEASE_DIR)"],
                          cwd=tmp_path, capture_output=True, text=True)
     assert out.stdout.split()[-2:] == ["3.4.5", "~/X"], out.stderr
+
+
+def test_build_proposes_the_latest_version(tmp_path):
+    """The version proposed by build.bat: the highest of the last build here, the one published
+    in the shared folder and the default of the source (not an old value of the source)."""
+    import json, shutil, subprocess, sys
+    from conftest import REPO
+    for name in ("update_version.py", "Exostaff_Activity_Report_Tool.py"):
+        shutil.copy(REPO / name, tmp_path / name)
+    share = tmp_path / "share"; share.mkdir()
+    (tmp_path / "build_config.txt").write_text(f"EXE_SHARE={share}\nDATA_SHARE={share}\n", encoding="utf-8")
+    run = lambda *a: subprocess.run([sys.executable, str(tmp_path / "update_version.py"), *a],
+                                    capture_output=True, text=True, check=True).stdout.strip()
+    (share / "VERSION.txt").write_text("7.0.2\n", encoding="utf-8")
+    assert run() == "7.0.2"                                  # published, no build here yet
+    (tmp_path / "build_info.json").write_text(json.dumps({"version": "7.1.0"}))
+    assert run() == "7.1.0"                                  # built here, not yet published
+    (share / "VERSION.txt").write_text("not a version", encoding="utf-8")
+    assert run() == "7.1.0"

@@ -33,13 +33,37 @@ def read_info() -> dict:
         return {}
 
 
+def _parse(v: str) -> tuple:
+    try:
+        return tuple(int(x) for x in v.strip().split("."))
+    except ValueError:
+        return (0,)
+
+
+def published_versions() -> list[str]:
+    """VERSION.txt published in the folders of build_config.txt (EXE_SHARE, DATA_SHARE)."""
+    found = []
+    try:
+        lines = (HERE / "build_config.txt").read_text(encoding="utf-8-sig").splitlines()
+    except OSError:
+        return found
+    for line in lines:
+        key, _, value = line.partition("=")
+        if key.strip() in ("EXE_SHARE", "DATA_SHARE") and value.strip():
+            try:
+                found.append((Path(value.strip()) / "VERSION.txt").read_text(encoding="utf-8-sig").strip())
+            except OSError:
+                pass
+    return found
+
+
 def current_version() -> str:
-    """The version of the last build on this PC, else the default in the source."""
-    version = read_info().get("version")
-    if version:
-        return version
+    """The highest of: the last build on this PC (build_info.json), the version
+    published in the shared folder (VERSION.txt), the default in the source."""
+    candidates = [read_info().get("version", "")] + published_versions()
     m = re.search(r'APP_VERSION\s*=\s*_BUILD\.get\("version",\s*"([^"]+)"\)', SCRIPT.read_text(encoding="utf-8"))
-    return m.group(1) if m else "1.0.0"
+    candidates.append(m.group(1) if m else "1.0.0")
+    return max((v for v in candidates if re.fullmatch(r"\d+\.\d+\.\d+", v or "")), key=_parse)
 
 
 def main(argv) -> int:
