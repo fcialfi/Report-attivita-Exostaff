@@ -84,10 +84,10 @@ def setup_log_file() -> None:
 # Configuration / constants
 # ---------------------------------------------------------------------------
 APP_TITLE         = "Activity Report Tool"
-APP_VERSION       = "1.1.2"   # updated by build.bat on each release
+APP_VERSION       = "1.2.6"   # updated by build.bat on each release
 # Release folder (VERSION.txt, EXE_LOCATION.txt, exe) — written by build.bat.
 # "~" = the user's home, so a OneDrive folder resolves on every PC.
-RELEASE_DIR       = ""
+RELEASE_DIR       = "~/OneDrive - eumetsat.int/Exostaff Report Generator"
 UPDATE_CHECK_MS   = 4 * 60 * 60 * 1000   # re-check for a new release while open
 SAVE_BACKUP_EVERY = 10
 
