@@ -4617,26 +4617,33 @@ class App:
 
         # (template label is shown in the header bar above)
 
-        # Row 1: inline label+field pairs in sub-frames so labels stay glued to their fields
+        # Form on one grid, so that labels and fields line up:
+        #   Date        [date 📅]  User [user]  Type [type]  Effort (PD) [pd]
+        #   WP          [wp     ]  Task [task ............................]
+        #   Description [text ..........................................]
         self.date_var = tk.StringVar(value=date.today().strftime("%d/%m/%y"))
         self.date_var.trace_add("write", self._validate_date)
 
-        def _pair(parent, label, widget_fn, pad_right=20):
-            f = ttk.Frame(parent)
-            ttk.Label(f, text=label).pack(side="left", padx=(0, 4))
-            w = widget_fn(f)
-            w.pack(side="left")
-            f.pack(side="left", padx=(0, pad_right))
-            return w
+        form = ttk.Frame(top)
+        form.grid(row=1, column=0, columnspan=8, sticky="we")
+        form.columnconfigure(8, weight=1)
 
-        row1 = ttk.Frame(top)
-        row1.grid(row=1, column=0, columnspan=8, sticky="w", pady=(6, 0))
+        def _label(text, row, col, sticky="w"):
+            ttk.Label(form, text=text).grid(row=row, column=col, sticky=sticky, padx=(0, 6),
+                                            pady=(0 if row == 0 else 4, 0))
 
-        self._date_entry = _pair(row1, "Date",
-            lambda f: ttk.Entry(f, textvariable=self.date_var, width=13))
+        def _place(widget, row, col, span=1, sticky="w", gap=18):
+            widget.grid(row=row, column=col, columnspan=span, sticky=sticky, padx=(0, gap),
+                        pady=(0 if row == 0 else 4, 0))
+            return widget
+
+        # Row 0: Date, User, Type, Effort
+        _label("Date", 0, 0)
+        date_box = ttk.Frame(form)
+        self._date_entry = ttk.Entry(date_box, textvariable=self.date_var, width=11)
+        self._date_entry.pack(side="left")
         add_tooltip(self._date_entry, "Format: DD/MM/YY  |  Click 📅 to pick")
 
-        # Calendar button next to date entry
         def _open_picker():
             try:
                 d = safe_date(self.date_var.get())
@@ -4644,65 +4651,51 @@ class App:
                 d = date.today()
             DatePicker(self._date_entry, d,
                        lambda picked: self.date_var.set(picked.strftime("%d/%m/%y")))
-        cal_btn = tk.Label(row1, text="📅", font=("Segoe UI", 11),
-                           bg=BG_FRAME, cursor="hand2", fg=ACCENT)
-        cal_btn.pack(side="left", padx=(2, 16))
+        cal_btn = tk.Label(date_box, text="📅", font=("Segoe UI", 11),
+                           bg=BG_PANEL, cursor="hand2", fg=ACCENT)
+        cal_btn.pack(side="left", padx=(4, 0))
         cal_btn.bind("<Button-1>", lambda e: _open_picker())
+        _place(date_box, 0, 1, sticky="we")
 
+        _label("User", 0, 2)
         self.user_var = tk.StringVar()
-        self.user_cb  = _pair(row1, "User",
-            lambda f: ttk.Combobox(f, textvariable=self.user_var,
-                                   values=self.users, width=26, state="readonly"))
+        self.user_cb = _place(ttk.Combobox(form, textvariable=self.user_var, values=self.users,
+                                           width=26, state="readonly"), 0, 3)
         if self.users:
             self.user_var.set(self.last_user if self.last_user in self.users else self.users[0])
-        # Populate combos (may already have values from config load)
-        if hasattr(self, "wp_cb") and self.tasks:
-            self._populate_wp_cb()
 
+        _label("Type", 0, 4)
         self.entry_type_var = tk.StringVar(value="Activity")
-        self.entry_type_cb  = _pair(row1, "Type",
-            lambda f: ttk.Combobox(f, textvariable=self.entry_type_var,
-                                   values=ENTRY_TYPES, width=12, state="readonly"))
+        self.entry_type_cb = _place(ttk.Combobox(form, textvariable=self.entry_type_var,
+                                                 values=ENTRY_TYPES, width=12, state="readonly"), 0, 5)
         self.entry_type_cb.bind("<<ComboboxSelected>>", lambda e: self.update_task_state())
 
+        _label("Effort (PD)", 0, 6)
         self.effort_var = tk.StringVar(value="1")
-        effort_entry    = _pair(row1, "Effort (PD)",
-            lambda f: ttk.Entry(f, textvariable=self.effort_var, width=7), pad_right=0)
+        effort_entry = _place(ttk.Entry(form, textvariable=self.effort_var, width=7), 0, 7, gap=0)
         add_tooltip(effort_entry, "Person-days, e.g. 0.5 or 1. Must be > 0.")
 
-        # Task row — full width
-        task_row = ttk.Frame(top)
-        task_row.grid(row=2, column=0, columnspan=8, sticky="we", pady=(4, 0))
-        top.columnconfigure(0, weight=1)
-        task_row.columnconfigure(3, weight=1)
-
-        # WP selector
-        ttk.Label(task_row, text="WP").grid(row=0, column=0, sticky="w", padx=(0, 4))
+        # Row 1: WP, Task (to the right edge)
+        _label("WP", 1, 0)
         self.wp_var = tk.StringVar()
-        self.wp_cb  = ttk.Combobox(task_row, textvariable=self.wp_var,
-                                    state="readonly", width=8)
-        self.wp_cb.grid(row=0, column=1, padx=(0, 12))
+        self.wp_cb = _place(ttk.Combobox(form, textvariable=self.wp_var, state="readonly", width=8),
+                            1, 1, sticky="we")
         add_tooltip(self.wp_cb, "Select Work Package to filter the task list.")
 
-        # Task selector
-        ttk.Label(task_row, text="Task").grid(row=0, column=2, sticky="w", padx=(0, 6))
+        _label("Task", 1, 2)
         self.task_var = tk.StringVar()
-        self.task_cb  = ttk.Combobox(task_row, textvariable=self.task_var,
-                                      state="readonly")
-        self.task_cb.grid(row=0, column=3, sticky="we")
+        self.task_cb = _place(ttk.Combobox(form, textvariable=self.task_var, state="readonly"),
+                              1, 3, span=6, sticky="we", gap=0)
 
         # Populate WP list and bind
         self._populate_wp_cb()
         self.wp_cb.bind("<<ComboboxSelected>>", lambda e: self._on_wp_changed())
 
-        # Description row — full width
-        desc_row = ttk.Frame(top)
-        desc_row.grid(row=3, column=0, columnspan=8, sticky="we", pady=(4, 0))
-        desc_row.columnconfigure(1, weight=1)
-        ttk.Label(desc_row, text="Description").grid(row=0, column=0, sticky="nw", padx=(0, 6))
-        self.desc = tk.Text(desc_row, height=4, font=("Segoe UI", 9), wrap="word", undo=True,
+        # Row 2: Description (to the right edge)
+        _label("Description", 2, 0, sticky="nw")
+        self.desc = tk.Text(form, height=4, font=("Segoe UI", 9), wrap="word", undo=True,
                             bg=BG_ENTRY, fg=FG_MAIN)
-        self.desc.grid(row=0, column=1, sticky="we")
+        _place(self.desc, 2, 1, span=8, sticky="we", gap=0)
         # Suggestions under the field: the descriptions already used for the task
         # (description_suggestions), shown once something is typed or on ↓ (the whole
         # list); arrows + Enter or a click take one, Esc closes
