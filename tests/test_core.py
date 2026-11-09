@@ -288,3 +288,14 @@ def test_update_waits_for_the_new_exe(tool):
     assert exe is None and "not the new version yet" in err
     (rel / "EXE_SHA256.txt").unlink()   # releases made before the fingerprint: as before
     assert T.get_latest_exe_path()[0] == rel / "ActivityReportTool.exe"
+
+
+def test_report_month_choice(tool):
+    from datetime import date
+    T = tool
+    assert T.default_report_month(date(2026, 11, 9)) == "2026-10"    # first days: last month's report
+    assert T.default_report_month(date(2026, 11, 11)) == "2026-11"
+    assert T.default_report_month(date(2027, 1, 5)) == "2026-12"     # across the year
+    assert T.month_label_of("2026-10") == "October 2026" and T.month_from_label("October 2026") == "2026-10"
+    labels = T.recent_month_labels(date(2026, 2, 20))
+    assert labels[:3] == ["February 2026", "January 2026", "December 2025"] and len(labels) == 12

@@ -1005,6 +1005,39 @@ def month_label(d: date) -> str:
 def full_month_label(d: date) -> str:
     return d.strftime("%B %Y")
 
+def default_report_month(today: date) -> str:
+    """"YYYY-MM" proposed for the monthly report: in the first 10 days of a
+    month the previous one (the report still to be done), then the current."""
+    d = today.replace(day=1) - timedelta(days=1) if today.day <= 10 else today
+    return d.strftime("%Y-%m")
+
+
+def month_label_of(ym: str) -> str:
+    """"2026-10" -> "October 2026" (the text as it is when it is not a month)."""
+    try:
+        y, m = map(int, ym.strip().split("-"))
+        return date(y, m, 1).strftime("%B %Y")
+    except ValueError:
+        return ym
+
+
+def month_from_label(label: str) -> str:
+    """"October 2026" -> "2026-10"."""
+    try:
+        return datetime.strptime(label.strip(), "%B %Y").strftime("%Y-%m")
+    except ValueError:
+        return label
+
+
+def recent_month_labels(today: date, count: int = 12) -> list[str]:
+    """The current month and the ``count`` - 1 before it, most recent first."""
+    y, m, out = today.year, today.month, []
+    for _ in range(count):
+        out.append(date(y, m, 1).strftime("%B %Y"))
+        y, m = (y, m - 1) if m > 1 else (y - 1, 12)
+    return out
+
+
 def last_day_of_month(year: int, month: int) -> date:
     if month == 12:
         return date(year, 12, 31)
@@ -4617,26 +4650,33 @@ class App:
 
         # (template label is shown in the header bar above)
 
-        # Row 1: inline label+field pairs in sub-frames so labels stay glued to their fields
+        # Form on one grid, so that labels and fields line up:
+        #   Date        [date 📅]  User [user]  Type [type]  Effort (PD) [pd]
+        #   WP          [wp     ]  Task [task ............................]
+        #   Description [text ..........................................]
         self.date_var = tk.StringVar(value=date.today().strftime("%d/%m/%y"))
         self.date_var.trace_add("write", self._validate_date)
 
-        def _pair(parent, label, widget_fn, pad_right=20):
-            f = ttk.Frame(parent)
-            ttk.Label(f, text=label).pack(side="left", padx=(0, 4))
-            w = widget_fn(f)
-            w.pack(side="left")
-            f.pack(side="left", padx=(0, pad_right))
-            return w
+        form = ttk.Frame(top)
+        form.grid(row=1, column=0, columnspan=8, sticky="we")
+        form.columnconfigure(8, weight=1)
 
-        row1 = ttk.Frame(top)
-        row1.grid(row=1, column=0, columnspan=8, sticky="w", pady=(6, 0))
+        def _label(text, row, col, sticky="w"):
+            ttk.Label(form, text=text).grid(row=row, column=col, sticky=sticky, padx=(0, 6),
+                                            pady=(0 if row == 0 else 4, 0))
 
-        self._date_entry = _pair(row1, "Date",
-            lambda f: ttk.Entry(f, textvariable=self.date_var, width=13))
+        def _place(widget, row, col, span=1, sticky="w", gap=18):
+            widget.grid(row=row, column=col, columnspan=span, sticky=sticky, padx=(0, gap),
+                        pady=(0 if row == 0 else 4, 0))
+            return widget
+
+        # Row 0: Date, User, Type, Effort
+        _label("Date", 0, 0)
+        date_box = ttk.Frame(form)
+        self._date_entry = ttk.Entry(date_box, textvariable=self.date_var, width=11)
+        self._date_entry.pack(side="left")
         add_tooltip(self._date_entry, "Format: DD/MM/YY  |  Click 📅 to pick")
 
-        # Calendar button next to date entry
         def _open_picker():
             try:
                 d = safe_date(self.date_var.get())
@@ -4644,65 +4684,51 @@ class App:
                 d = date.today()
             DatePicker(self._date_entry, d,
                        lambda picked: self.date_var.set(picked.strftime("%d/%m/%y")))
-        cal_btn = tk.Label(row1, text="📅", font=("Segoe UI", 11),
-                           bg=BG_FRAME, cursor="hand2", fg=ACCENT)
-        cal_btn.pack(side="left", padx=(2, 16))
+        cal_btn = tk.Label(date_box, text="📅", font=("Segoe UI", 11),
+                           bg=BG_PANEL, cursor="hand2", fg=ACCENT)
+        cal_btn.pack(side="left", padx=(4, 0))
         cal_btn.bind("<Button-1>", lambda e: _open_picker())
+        _place(date_box, 0, 1, sticky="we")
 
+        _label("User", 0, 2)
         self.user_var = tk.StringVar()
-        self.user_cb  = _pair(row1, "User",
-            lambda f: ttk.Combobox(f, textvariable=self.user_var,
-                                   values=self.users, width=26, state="readonly"))
+        self.user_cb = _place(ttk.Combobox(form, textvariable=self.user_var, values=self.users,
+                                           width=26, state="readonly"), 0, 3)
         if self.users:
             self.user_var.set(self.last_user if self.last_user in self.users else self.users[0])
-        # Populate combos (may already have values from config load)
-        if hasattr(self, "wp_cb") and self.tasks:
-            self._populate_wp_cb()
 
+        _label("Type", 0, 4)
         self.entry_type_var = tk.StringVar(value="Activity")
-        self.entry_type_cb  = _pair(row1, "Type",
-            lambda f: ttk.Combobox(f, textvariable=self.entry_type_var,
-                                   values=ENTRY_TYPES, width=12, state="readonly"))
+        self.entry_type_cb = _place(ttk.Combobox(form, textvariable=self.entry_type_var,
+                                                 values=ENTRY_TYPES, width=12, state="readonly"), 0, 5)
         self.entry_type_cb.bind("<<ComboboxSelected>>", lambda e: self.update_task_state())
 
+        _label("Effort (PD)", 0, 6)
         self.effort_var = tk.StringVar(value="1")
-        effort_entry    = _pair(row1, "Effort (PD)",
-            lambda f: ttk.Entry(f, textvariable=self.effort_var, width=7), pad_right=0)
+        effort_entry = _place(ttk.Entry(form, textvariable=self.effort_var, width=7), 0, 7, gap=0)
         add_tooltip(effort_entry, "Person-days, e.g. 0.5 or 1. Must be > 0.")
 
-        # Task row — full width
-        task_row = ttk.Frame(top)
-        task_row.grid(row=2, column=0, columnspan=8, sticky="we", pady=(4, 0))
-        top.columnconfigure(0, weight=1)
-        task_row.columnconfigure(3, weight=1)
-
-        # WP selector
-        ttk.Label(task_row, text="WP").grid(row=0, column=0, sticky="w", padx=(0, 4))
+        # Row 1: WP, Task (to the right edge)
+        _label("WP", 1, 0)
         self.wp_var = tk.StringVar()
-        self.wp_cb  = ttk.Combobox(task_row, textvariable=self.wp_var,
-                                    state="readonly", width=8)
-        self.wp_cb.grid(row=0, column=1, padx=(0, 12))
+        self.wp_cb = _place(ttk.Combobox(form, textvariable=self.wp_var, state="readonly", width=8),
+                            1, 1, sticky="we")
         add_tooltip(self.wp_cb, "Select Work Package to filter the task list.")
 
-        # Task selector
-        ttk.Label(task_row, text="Task").grid(row=0, column=2, sticky="w", padx=(0, 6))
+        _label("Task", 1, 2)
         self.task_var = tk.StringVar()
-        self.task_cb  = ttk.Combobox(task_row, textvariable=self.task_var,
-                                      state="readonly")
-        self.task_cb.grid(row=0, column=3, sticky="we")
+        self.task_cb = _place(ttk.Combobox(form, textvariable=self.task_var, state="readonly"),
+                              1, 3, span=6, sticky="we", gap=0)
 
         # Populate WP list and bind
         self._populate_wp_cb()
         self.wp_cb.bind("<<ComboboxSelected>>", lambda e: self._on_wp_changed())
 
-        # Description row — full width
-        desc_row = ttk.Frame(top)
-        desc_row.grid(row=3, column=0, columnspan=8, sticky="we", pady=(4, 0))
-        desc_row.columnconfigure(1, weight=1)
-        ttk.Label(desc_row, text="Description").grid(row=0, column=0, sticky="nw", padx=(0, 6))
-        self.desc = tk.Text(desc_row, height=4, font=("Segoe UI", 9), wrap="word", undo=True,
+        # Row 2: Description (to the right edge)
+        _label("Description", 2, 0, sticky="nw")
+        self.desc = tk.Text(form, height=4, font=("Segoe UI", 9), wrap="word", undo=True,
                             bg=BG_ENTRY, fg=FG_MAIN)
-        self.desc.grid(row=0, column=1, sticky="we")
+        _place(self.desc, 2, 1, span=8, sticky="we", gap=0)
         # Suggestions under the field: the descriptions already used for the task
         # (description_suggestions), shown once something is typed or on ↓ (the whole
         # list); arrows + Enter or a click take one, Esc closes
@@ -4864,9 +4890,33 @@ class App:
         ttk.Label(bottom, text="Month", font=bold).grid(row=1, column=0, sticky="w", padx=(0, 10), pady=(4, 0))
         month_frame = ttk.Frame(bottom)
         month_frame.grid(row=1, column=1, sticky="w", padx=(0, 12), pady=(4, 0))
-        self.month_var = tk.StringVar(value=date.today().strftime("%Y-%m"))
-        ttk.Entry(month_frame, textvariable=self.month_var, width=10).pack(side="left")
-        ttk.Label(month_frame, text="YYYY-MM", foreground=FG_DIM).pack(side="left", padx=(6, 0))
+        # month_var keeps "YYYY-MM" for the reports; the box shows "October 2026"
+        self.month_var = tk.StringVar(value=default_report_month(date.today()))
+        self._month_label_var = tk.StringVar()
+
+        btn_m_prev = tk.Label(month_frame, text="◀", font=("Segoe UI", 10),
+                              fg=ACCENT, bg=BG_PANEL, cursor="hand2")
+        btn_m_prev.pack(side="left", padx=(0, 1))
+        btn_m_prev.bind("<Button-1>", lambda e: self._step_month(-1))
+        add_tooltip(btn_m_prev, "Previous month")
+
+        self._month_cb = ttk.Combobox(month_frame, textvariable=self._month_label_var, width=15,
+                                      state="readonly", values=recent_month_labels(date.today()))
+        self._month_cb.pack(side="left", padx=1)
+        self._month_cb.bind("<<ComboboxSelected>>",
+                            lambda e: self.month_var.set(month_from_label(self._month_label_var.get())))
+        add_tooltip(self._month_cb, "Month of the monthly report and statistics. In the first 10 days of a "
+                                    "month the previous one is proposed.")
+
+        btn_m_next = tk.Label(month_frame, text="▶", font=("Segoe UI", 10),
+                              fg=ACCENT, bg=BG_PANEL, cursor="hand2")
+        btn_m_next.pack(side="left", padx=(1, 0))
+        btn_m_next.bind("<Button-1>", lambda e: self._step_month(+1))
+        add_tooltip(btn_m_next, "Next month")
+
+        self.month_var.trace_add("write", lambda *_: self._month_label_var.set(
+            month_label_of(self.month_var.get())))
+        self._month_label_var.set(month_label_of(self.month_var.get()))
 
         _action(1, 2, "📄  Monthly Word", self.monthly,
                 "Aggregate all weekly archives for the selected month and fill the Word template.")
@@ -5524,6 +5574,15 @@ class App:
         except Exception as e:
             log.error("reset_data: %s", e)
             messagebox.showerror("Reset error", str(e))
+
+    def _step_month(self, delta: int) -> None:
+        try:
+            y, m = map(int, self.month_var.get().split("-"))
+        except ValueError:
+            y, m = date.today().year, date.today().month
+        m += delta
+        y, m = y + (m - 1) // 12, (m - 1) % 12 + 1
+        self.month_var.set(f"{y}-{m:02d}")
 
     def _step_week(self, delta: int) -> None:
         """Advance or retreat the CW selector by delta weeks (+1 or -1)."""
@@ -6524,7 +6583,8 @@ At the end of each month:
   1. Make sure all team members have saved their weekly data
      to the shared folder (Scenario A) or exchanged JSON files
      (Scenario B — see section 5).
-  2. Set the Month field (YYYY-MM) in the bottom bar.
+  2. Choose the month in the row "Month" of the bottom bar (◀ ▶ or the
+     list). In the first 10 days of a month the previous one is proposed.
   3. Click "📄 Monthly Word" (row "Month" of the bottom bar).
   4. Choose where to save the output .docx file.
 

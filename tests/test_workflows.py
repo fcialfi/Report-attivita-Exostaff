@@ -208,3 +208,15 @@ def test_new_entry_clears_the_form_and_stops_editing(session, tool):
     assert s.app.edit_index is None and s.app.desc.get("1.0", "end").strip() == ""
     s.add(mon, "second")                    # saved as a new entry, the first unchanged
     assert s.table() == ["first", "second"]
+
+
+def test_month_box_and_arrows(session, tool):
+    s = session(date(2026, 11, 9))
+    a = s.app
+    assert a.month_var.get() == "2026-10" and a._month_label_var.get() == "October 2026"
+    a._step_month(+3)
+    assert a.month_var.get() == "2027-01" and a._month_label_var.get() == "January 2027"
+    a._month_label_var.set("August 2026"); a._month_cb.event_generate("<<ComboboxSelected>>")
+    assert a.month_var.get() == "2026-08"
+    a.month_var.set("2026-09")                  # set from elsewhere: the box follows
+    assert a._month_label_var.get() == "September 2026"
