@@ -1005,6 +1005,39 @@ def month_label(d: date) -> str:
 def full_month_label(d: date) -> str:
     return d.strftime("%B %Y")
 
+def default_report_month(today: date) -> str:
+    """"YYYY-MM" proposed for the monthly report: in the first 10 days of a
+    month the previous one (the report still to be done), then the current."""
+    d = today.replace(day=1) - timedelta(days=1) if today.day <= 10 else today
+    return d.strftime("%Y-%m")
+
+
+def month_label_of(ym: str) -> str:
+    """"2026-10" -> "October 2026" (the text as it is when it is not a month)."""
+    try:
+        y, m = map(int, ym.strip().split("-"))
+        return date(y, m, 1).strftime("%B %Y")
+    except ValueError:
+        return ym
+
+
+def month_from_label(label: str) -> str:
+    """"October 2026" -> "2026-10"."""
+    try:
+        return datetime.strptime(label.strip(), "%B %Y").strftime("%Y-%m")
+    except ValueError:
+        return label
+
+
+def recent_month_labels(today: date, count: int = 12) -> list[str]:
+    """The current month and the ``count`` - 1 before it, most recent first."""
+    y, m, out = today.year, today.month, []
+    for _ in range(count):
+        out.append(date(y, m, 1).strftime("%B %Y"))
+        y, m = (y, m - 1) if m > 1 else (y - 1, 12)
+    return out
+
+
 def last_day_of_month(year: int, month: int) -> date:
     if month == 12:
         return date(year, 12, 31)
@@ -4857,9 +4890,33 @@ class App:
         ttk.Label(bottom, text="Month", font=bold).grid(row=1, column=0, sticky="w", padx=(0, 10), pady=(4, 0))
         month_frame = ttk.Frame(bottom)
         month_frame.grid(row=1, column=1, sticky="w", padx=(0, 12), pady=(4, 0))
-        self.month_var = tk.StringVar(value=date.today().strftime("%Y-%m"))
-        ttk.Entry(month_frame, textvariable=self.month_var, width=10).pack(side="left")
-        ttk.Label(month_frame, text="YYYY-MM", foreground=FG_DIM).pack(side="left", padx=(6, 0))
+        # month_var keeps "YYYY-MM" for the reports; the box shows "October 2026"
+        self.month_var = tk.StringVar(value=default_report_month(date.today()))
+        self._month_label_var = tk.StringVar()
+
+        btn_m_prev = tk.Label(month_frame, text="◀", font=("Segoe UI", 10),
+                              fg=ACCENT, bg=BG_PANEL, cursor="hand2")
+        btn_m_prev.pack(side="left", padx=(0, 1))
+        btn_m_prev.bind("<Button-1>", lambda e: self._step_month(-1))
+        add_tooltip(btn_m_prev, "Previous month")
+
+        self._month_cb = ttk.Combobox(month_frame, textvariable=self._month_label_var, width=15,
+                                      state="readonly", values=recent_month_labels(date.today()))
+        self._month_cb.pack(side="left", padx=1)
+        self._month_cb.bind("<<ComboboxSelected>>",
+                            lambda e: self.month_var.set(month_from_label(self._month_label_var.get())))
+        add_tooltip(self._month_cb, "Month of the monthly report and statistics. In the first 10 days of a "
+                                    "month the previous one is proposed.")
+
+        btn_m_next = tk.Label(month_frame, text="▶", font=("Segoe UI", 10),
+                              fg=ACCENT, bg=BG_PANEL, cursor="hand2")
+        btn_m_next.pack(side="left", padx=(1, 0))
+        btn_m_next.bind("<Button-1>", lambda e: self._step_month(+1))
+        add_tooltip(btn_m_next, "Next month")
+
+        self.month_var.trace_add("write", lambda *_: self._month_label_var.set(
+            month_label_of(self.month_var.get())))
+        self._month_label_var.set(month_label_of(self.month_var.get()))
 
         _action(1, 2, "📄  Monthly Word", self.monthly,
                 "Aggregate all weekly archives for the selected month and fill the Word template.")
@@ -5517,6 +5574,15 @@ class App:
         except Exception as e:
             log.error("reset_data: %s", e)
             messagebox.showerror("Reset error", str(e))
+
+    def _step_month(self, delta: int) -> None:
+        try:
+            y, m = map(int, self.month_var.get().split("-"))
+        except ValueError:
+            y, m = date.today().year, date.today().month
+        m += delta
+        y, m = y + (m - 1) // 12, (m - 1) % 12 + 1
+        self.month_var.set(f"{y}-{m:02d}")
 
     def _step_week(self, delta: int) -> None:
         """Advance or retreat the CW selector by delta weeks (+1 or -1)."""
@@ -6517,7 +6583,8 @@ At the end of each month:
   1. Make sure all team members have saved their weekly data
      to the shared folder (Scenario A) or exchanged JSON files
      (Scenario B — see section 5).
-  2. Set the Month field (YYYY-MM) in the bottom bar.
+  2. Choose the month in the row "Month" of the bottom bar (◀ ▶ or the
+     list). In the first 10 days of a month the previous one is proposed.
   3. Click "📄 Monthly Word" (row "Month" of the bottom bar).
   4. Choose where to save the output .docx file.
 
