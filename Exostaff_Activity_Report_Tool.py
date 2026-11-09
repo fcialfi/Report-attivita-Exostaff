@@ -421,6 +421,23 @@ HOLIDAYS_TEMPLATE = """# EUMETSAT Public Holidays
 2026-12-24 | Christmas Eve
 2026-12-25 | Christmas Day
 2026-12-31 | New Year\'s Eve
+
+# 2027
+2027-01-01 | New Year\'s Day
+2027-02-08 | Rosenmontag
+2027-03-26 | Good Friday
+2027-03-29 | Easter Monday
+2027-05-06 | Ascension Day
+2027-05-07 | Ascension Day Extension
+2027-05-17 | Whit Monday
+2027-05-27 | Corpus Christi
+2027-05-28 | Corpus Christi Extension
+2027-09-06 | Unification Day Bulgaria
+2027-10-29 | Republic Day Türkiye
+2027-12-24 | Christmas Eve (pm, 1/2 day)
+2027-12-27 | Christmas Day Extension
+2027-12-28 | Christmas 2nd Day Extension
+2027-12-31 | New Year\'s Eve
 """
 
 
