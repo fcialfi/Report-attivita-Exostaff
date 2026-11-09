@@ -24,23 +24,29 @@ for /f "skip=1 delims=" %%l in (_cfg_tmp.txt) do (
 del _cfg_tmp.txt 2>nul
 
 :: ── Ask only if not configured ──────────────────────────────────────────
+set ASKED=
 if "%EXE_SHARE%"=="" (
     echo.
     echo  Where should the exe be copied?
     echo  e.g. N:\temp\Fabio\Exostaff Report Generator
     set /p EXE_SHARE=  Exe destination: 
+    set ASKED=1
 )
 if "%DATA_SHARE%"=="" (
     echo.
     echo  Where is the working data folder?
     set /p DATA_SHARE=  Data folder: 
+    set ASKED=1
 )
 
-:: Save config for next time
-(
-echo EXE_SHARE=%EXE_SHARE%
-echo DATA_SHARE=%DATA_SHARE%
-) > build_config.txt
+:: Save config for next time — only when something was asked, so that a
+:: normal build leaves the repository files untouched (git pull keeps working)
+if defined ASKED (
+    (
+    echo EXE_SHARE=%EXE_SHARE%
+    echo DATA_SHARE=%DATA_SHARE%
+    ) > build_config.txt
+)
 
 echo.
 echo  Exe  ^> %EXE_SHARE%
@@ -75,7 +81,7 @@ if exist %APP_NAME%.spec del %APP_NAME%.spec
 :: ── Build ───────────────────────────────────────────────────────────────
 echo.
 echo  [INFO] Building exe...
-python -m PyInstaller --onefile --windowed --name "%APP_NAME%" --icon "assets\exostaff_icon.ico" --add-data "assets;assets" --distpath "%DIST_DIR%" --workpath "%BUILD_DIR%" --clean %SCRIPT% >> %LOG_FILE% 2>&1
+python -m PyInstaller --onefile --windowed --name "%APP_NAME%" --icon "assets\exostaff_icon.ico" --add-data "assets;assets" --add-data "build_info.json;." --distpath "%DIST_DIR%" --workpath "%BUILD_DIR%" --clean %SCRIPT% >> %LOG_FILE% 2>&1
 if errorlevel 1 ( echo [ERROR] Build FAILED. See %LOG_FILE%. & pause & exit /b 1 )
 echo  [OK] Build successful.
 

@@ -299,3 +299,31 @@ def test_report_month_choice(tool):
     assert T.month_label_of("2026-10") == "October 2026" and T.month_from_label("October 2026") == "2026-10"
     labels = T.recent_month_labels(date(2026, 2, 20))
     assert labels[:3] == ["February 2026", "January 2026", "December 2025"] and len(labels) == 12
+
+
+def test_build_does_not_modify_the_source(tmp_path):
+    """build.bat (update_version.py) writes build_info.json, not the .py: git pull is never blocked."""
+    import json, shutil, subprocess, sys
+    from conftest import REPO
+    for name in ("update_version.py", "Exostaff_Activity_Report_Tool.py"):
+        shutil.copy(REPO / name, tmp_path / name)
+    source = (tmp_path / "Exostaff_Activity_Report_Tool.py").read_bytes()
+    run = lambda *a: subprocess.run([sys.executable, str(tmp_path / "update_version.py"), *a],
+                                    capture_output=True, text=True, check=True).stdout
+    default = run().strip()
+    assert default.count(".") == 2                                    # the default of the source
+    run("2.0.1", str(tmp_path / "share"))
+    info = json.loads((tmp_path / "build_info.json").read_text(encoding="utf-8"))
+    assert info["version"] == "2.0.1" and info["release_dir"].endswith("share")
+    assert run().strip() == "2.0.1"                                   # next build proposes it
+    assert (tmp_path / "Exostaff_Activity_Report_Tool.py").read_bytes() == source
+
+
+def test_build_info_read_at_start(tmp_path):
+    import json, subprocess, sys, shutil
+    from conftest import REPO
+    shutil.copy(REPO / "Exostaff_Activity_Report_Tool.py", tmp_path / "tool.py")
+    (tmp_path / "build_info.json").write_text(json.dumps({"version": "3.4.5", "release_dir": "~/X"}))
+    out = subprocess.run([sys.executable, "-c", "import tool; print(tool.APP_VERSION, tool.RELEASE_DIR)"],
+                         cwd=tmp_path, capture_output=True, text=True)
+    assert out.stdout.split()[-2:] == ["3.4.5", "~/X"], out.stderr

@@ -1,14 +1,19 @@
-"""Helper script called by build.bat to read/update APP_VERSION (and RELEASE_DIR)
-in the main script.
+"""Helper script called by build.bat to read/set the version and the release
+folder of the build. They go to build_info.json (not in git), which build.bat
+bundles into the exe: the source file is never modified, so `git pull` is
+never blocked by a build.
 
     python update_version.py                       -> print current version
     python update_version.py 1.2.0 [release_dir]   -> set version (+ release folder)
 """
+import json
 import re
 import sys
 from pathlib import Path
 
-SCRIPT = "Exostaff_Activity_Report_Tool.py"
+HERE = Path(__file__).resolve().parent
+SCRIPT = HERE / "Exostaff_Activity_Report_Tool.py"
+BUILD_INFO = HERE / "build_info.json"
 
 
 def home_relative(path: str) -> str:
@@ -21,25 +26,39 @@ def home_relative(path: str) -> str:
         return p.as_posix()   # e.g. a network drive N:\... — same for everybody
 
 
-with open(SCRIPT, "r", encoding="utf-8") as f:
-    s = f.read()
+def read_info() -> dict:
+    try:
+        return json.loads(BUILD_INFO.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
 
-if len(sys.argv) == 1:
-    m = re.search(r'APP_VERSION\s*=\s*"([^"]+)"', s)
-    print(m.group(1) if m else "1.0.0")
-    sys.exit(0)
 
-new_ver = sys.argv[1].strip()
-if not re.fullmatch(r"\d+\.\d+\.\d+", new_ver):
-    print(f"[ERROR] Version must look like 1.2.0 (got {new_ver!r})")
-    sys.exit(1)
-s = re.sub(r'APP_VERSION\s*=\s*"[^"]*"', f'APP_VERSION       = "{new_ver}"', s, count=1)
+def current_version() -> str:
+    """The version of the last build on this PC, else the default in the source."""
+    version = read_info().get("version")
+    if version:
+        return version
+    m = re.search(r'APP_VERSION\s*=\s*_BUILD\.get\("version",\s*"([^"]+)"\)', SCRIPT.read_text(encoding="utf-8"))
+    return m.group(1) if m else "1.0.0"
 
-if len(sys.argv) > 2:
-    rel = home_relative(sys.argv[2])
-    s = re.sub(r'RELEASE_DIR\s*=\s*"[^"]*"', lambda _m: f'RELEASE_DIR       = "{rel}"', s, count=1)
-    print(f"[OK] Release folder: {rel}")
 
-with open(SCRIPT, "w", encoding="utf-8") as f:
-    f.write(s)
-print(f"[OK] Version updated to {new_ver}")
+def main(argv) -> int:
+    if not argv:
+        print(current_version())
+        return 0
+    new_ver = argv[0].strip()
+    if not re.fullmatch(r"\d+\.\d+\.\d+", new_ver):
+        print(f"[ERROR] Version must look like 1.2.0 (got {new_ver!r})")
+        return 1
+    info = read_info()
+    info["version"] = new_ver
+    if len(argv) > 1:
+        info["release_dir"] = home_relative(argv[1])
+        print(f"[OK] Release folder: {info['release_dir']}")
+    BUILD_INFO.write_text(json.dumps(info, indent=2) + "\n", encoding="utf-8")
+    print(f"[OK] Version updated to {new_ver}")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))
