@@ -228,13 +228,13 @@ def test_archive_notice_next_to_save_entry(session, tool):
     notice = lambda: s.app._archive_notice.winfo_manager() and s.app._archive_notice_var.get()
     assert not notice()
     s.add(mon, "A"); s.add(mon, "B")
-    assert notice() == "● 2 changes not in the week archive yet"
+    assert notice() == "● 2 changes not in the week archive yet — 💾 Save week below"
     s.save_week()
     assert not notice()
     s.edit("A", new_desc="A2")              # an edited entry counts once
-    assert notice() == "● 1 change not in the week archive yet"
+    assert notice() == "● 1 change not in the week archive yet — 💾 Save week below"
     s.delete("B")
-    assert notice() == "● 2 changes not in the week archive yet"
+    assert notice() == "● 2 changes not in the week archive yet — 💾 Save week below"
     s.save_week()
     assert not notice() and tool.pending_archive_changes(s.app.data, s.app._loaded_week_keys) == 0
 
