@@ -220,3 +220,20 @@ def test_month_box_and_arrows(session, tool):
     assert a.month_var.get() == "2026-08"
     a.month_var.set("2026-09")                  # set from elsewhere: the box follows
     assert a._month_label_var.get() == "September 2026"
+
+
+def test_archive_notice_next_to_save_entry(session, tool):
+    mon = date(2026, 10, 19)
+    s = session(mon)
+    notice = lambda: s.app._archive_notice.winfo_manager() and s.app._archive_notice_var.get()
+    assert not notice()
+    s.add(mon, "A"); s.add(mon, "B")
+    assert notice() == "● 2 changes not in the week archive yet"
+    s.save_week()
+    assert not notice()
+    s.edit("A", new_desc="A2")              # an edited entry counts once
+    assert notice() == "● 1 change not in the week archive yet"
+    s.delete("B")
+    assert notice() == "● 2 changes not in the week archive yet"
+    s.save_week()
+    assert not notice() and tool.pending_archive_changes(s.app.data, s.app._loaded_week_keys) == 0

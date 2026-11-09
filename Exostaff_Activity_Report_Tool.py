@@ -1366,6 +1366,28 @@ def load_week_entries(year: int, cw: int) -> list:
         return []
 
 
+def pending_archive_changes(data: list, loaded_keys) -> int:
+    """Entries that "Save week" would add, remove or change in the weekly
+    archives (an edited entry counts once)."""
+    groups: dict[tuple, list] = {}
+    for a in normalise_data(data):
+        try:
+            groups.setdefault(iso_year_week_for_date(safe_date(a["date"])), []).append(a)
+        except ValueError:
+            pass
+    weeks = set(groups) | {w for w in map(_week_of_key, loaded_keys) if w}
+    changes = 0
+    for y, cw in weeks:
+        existing = Counter(map(activity_key, load_week_entries(y, cw)))
+        merged = Counter(map(activity_key, merge_week(load_week_entries(y, cw), groups.get((y, cw), []),
+                                                      loaded_keys)))
+        added, removed = merged - existing, existing - merged
+        # the old and new version of an edited entry: same date, user, type and task
+        edited = (Counter(k[:4] for k in added.elements()) & Counter(k[:4] for k in removed.elements()))
+        changes += sum(added.values()) + sum(removed.values()) - sum(edited.values())
+    return changes
+
+
 def archive_is_up_to_date(data: list, loaded_keys: set) -> bool:
     """True if "Save week" would not change any weekly archive file."""
     groups: dict[tuple, list] = {}
@@ -4449,12 +4471,29 @@ class App:
         self._table_dirty = True
         if hasattr(self, "_btn_save_cw"):
             self._btn_save_cw.configure(style="Accent.TButton")
+        self._update_archive_notice()
+
+    def _update_archive_notice(self) -> None:
+        """"● N changes not in the week archive yet  [Save week]" next to Save entry."""
+        if not hasattr(self, "_archive_notice"):
+            return
+        try:
+            n = pending_archive_changes(self.data, self._loaded_week_keys) if self._table_dirty else 0
+        except Exception as exc:
+            log.warning("pending_archive_changes: %s", exc)
+            n = 0
+        if n:
+            self._archive_notice_var.set(f"● {n} change{'s' if n > 1 else ''} not in the week archive yet")
+            self._archive_notice.pack(side="left", padx=(28, 0))
+        else:
+            self._archive_notice.pack_forget()
 
     def _clear_table_dirty(self) -> None:
         """Clear dirty flag after successful save."""
         self._table_dirty = False
         if hasattr(self, "_btn_save_cw"):
             self._btn_save_cw.configure(style="TButton")
+        self._update_archive_notice()
 
     def _collect_ref_date(self) -> date:
         dates = []
@@ -4758,6 +4797,18 @@ class App:
         btn_new = ttk.Button(btn_row, text="✚  New entry", command=self.new_entry)
         btn_new.pack(side="left")
         add_tooltip(btn_new, "Clear the form for a new entry (stops editing the selected one).")
+
+        # Shown only while the table has changes not yet in the weekly archive
+        self._archive_notice = ttk.Frame(btn_row)
+        self._archive_notice_var = tk.StringVar()
+        ttk.Label(self._archive_notice, textvariable=self._archive_notice_var, foreground="#e07b00",
+                  font=("Segoe UI", 9, "bold")).pack(side="left", padx=(0, 8))
+        btn_save_week2 = ttk.Button(self._archive_notice, text="💾  Save week",
+                                    command=self.save_current_week_button, style="Accent.TButton")
+        btn_save_week2.pack(side="left")
+        add_tooltip(btn_save_week2, "Save the table to the weekly archive (same as Save week below). "
+                                    "Needed before loading another week; the monthly report, the "
+                                    "statistics and the suggestions read the archive.")
 
 
         # ── Divider ─────────────────────────────────────────────────────────
