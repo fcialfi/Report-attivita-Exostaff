@@ -191,3 +191,20 @@ def test_description_suggestions_in_the_form(session, tool):
     assert a._accept_suggestion_key() is None   # Enter with nothing chosen: a new line, as before
     a.task_var.set("2 - T2")
     assert not a._suggestions_shown()            # another task: the list closes
+
+
+def test_new_entry_clears_the_form_and_stops_editing(session, tool):
+    mon = date(2026, 10, 19)
+    s = session(mon)
+    s.add(mon, "first")
+    s._select("first"); s.app.load_selected_for_edit()
+    assert s.app.edit_index == 0
+    s.app.desc.insert("end", " changed")
+    tool.answers["yesno"] = False
+    s.app.new_entry()                       # unsaved changes, "No": nothing happens
+    assert s.app.edit_index == 0
+    tool.answers["yesno"] = True
+    s.app.new_entry()
+    assert s.app.edit_index is None and s.app.desc.get("1.0", "end").strip() == ""
+    s.add(mon, "second")                    # saved as a new entry, the first unchanged
+    assert s.table() == ["first", "second"]

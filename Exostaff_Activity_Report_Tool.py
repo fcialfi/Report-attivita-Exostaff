@@ -139,7 +139,7 @@ def require_io_dir() -> bool:
     messagebox.showerror(
         "No folder selected",
         "Please set the Working folder first.\n\n"
-        "Click the 📁 button at the top of the window.",
+        "Use File → Working folder… in the menu.",
     )
     return False
 
@@ -4130,7 +4130,7 @@ class App:
                 f"The saved working folder was not found:\n\n{missing}\n\n"
                 f"This can happen if a network drive is disconnected or "
                 f"OneDrive has changed the path.\n\n"
-                f"Please set the working folder again with the 📁 button.",
+                f"Please set the working folder again with File → Working folder….",
             )
 
         # Show version update notice if needed
@@ -4154,36 +4154,36 @@ class App:
     def _build_menu(self):
         menubar = tk.Menu(self.root)
 
-        # File
+        # File: where the data and the template are; exchange of the table
         m_file = tk.Menu(menubar, tearoff=0)
+        m_file.add_command(label="Working folder…",          command=self.choose_io_dir)
+        m_file.add_command(label="Word template…",           command=self.choose_template)
+        m_file.add_separator()
         m_file.add_command(label="Export table (CSV/JSON)…", command=self.export_table)
         m_file.add_command(label="Export table to Excel…",   command=self.export_xlsx)
         m_file.add_command(label="Import entries from another user (CSV/JSON)…", command=self.import_table)
         m_file.add_separator()
-        m_file.add_command(label="Set working folder…", command=self.choose_io_dir)
-        m_file.add_separator()
-        m_file.add_command(label="Reset…",                 command=self.reset_data)
-        m_file.add_separator()
-        m_file.add_command(label="Exit",                   command=self.on_close)
+        m_file.add_command(label="Reset…",                   command=self.reset_data)
+        m_file.add_command(label="Exit",                     command=self.on_close)
         menubar.add_cascade(label="File", menu=m_file)
 
-        # Edit
+        # Edit: the configuration, then the table
         m_edit = tk.Menu(menubar, tearoff=0)
-        m_edit.add_command(label="Next-week plan…",  command=self.open_next_week_editor)
-        m_edit.add_command(label="Remove duplicate entries…", command=self.remove_duplicates)
+        m_edit.add_command(label="Users…",             command=self.open_users_config)
+        m_edit.add_command(label="Tasks…",             command=self.open_tasks_config)
+        m_edit.add_command(label="Holidays…",          command=self.open_holidays_config)
         m_edit.add_command(label="Report parameters…", command=self.open_report_params)
+        m_edit.add_command(label="Reload config",      command=self.reload_config_from_files)
         m_edit.add_separator()
-        m_edit.add_command(label="Edit users…",       command=self.open_users_config)
-        m_edit.add_command(label="Edit tasks…",       command=self.open_tasks_config)
-        m_edit.add_command(label="Edit holidays…",    command=self.open_holidays_config)
-        m_edit.add_command(label="Reload config",     command=self.reload_config_from_files)
+        m_edit.add_command(label="Next-week plan…",    command=self.open_next_week_editor)
+        m_edit.add_command(label="Remove duplicate entries…", command=self.remove_duplicates)
         menubar.add_cascade(label="Edit", menu=m_edit)
 
         # View
         m_view = tk.Menu(menubar, tearoff=0)
-        m_view.add_command(label="Monthly statistics…", command=self.show_stats)
-        m_view.add_command(label="Task trend…",         command=self.show_trend)
-        m_view.add_command(label="Refresh\tF5",         command=self.refresh)
+        m_view.add_command(label="Statistics…",  command=self.show_stats)
+        m_view.add_command(label="Task trend…",  command=self.show_trend)
+        m_view.add_command(label="Refresh\tF5", command=self.refresh)
         menubar.add_cascade(label="View", menu=m_view)
 
         # Help
@@ -4609,33 +4609,11 @@ class App:
         top.pack(fill="x", expand=True)
         top.columnconfigure(0, weight=1)
 
-        # Row 0: Template | IO folder — both left-aligned
-        r0 = ttk.Frame(top)
-        r0.grid(row=0, column=0, columnspan=8, sticky="w", pady=(0, 4))
-
-        btn_tmpl = ttk.Button(r0, text="📂  Select Word template", command=self.choose_template)
-        btn_tmpl.pack(side="left")
-        add_tooltip(btn_tmpl, "Load a .docx template to extract users and tasks.")
-
-        ttk.Separator(r0, orient="vertical").pack(side="left", fill="y", padx=(14, 14))
-
-        btn_io_dir = ttk.Button(r0, text="📁  Working folder", command=self.choose_io_dir)
-        btn_io_dir.pack(side="left")
-        add_tooltip(btn_io_dir, "Set the main working folder on the network share\n(weekly_reports, config and all data files live here).")
-
+        # Working folder and template: File menu; the folder is shown in the
+        # status bar, the template state in the header
         self._io_dir_var = tk.StringVar(
             value=self.last_io_dir if self.last_io_dir else "⚠  No folder selected"
         )
-        ttk.Label(r0, textvariable=self._io_dir_var, foreground=FG_DIM,
-                  font=("Segoe UI", 8)).pack(side="left", padx=(8, 0))
-
-        ttk.Separator(r0, orient="vertical").pack(side="left", fill="y", padx=(14, 14))
-
-        btn_reload_cfg = ttk.Button(r0, text="🔄  Reload config",
-                                    command=self.reload_config_from_files)
-        btn_reload_cfg.pack(side="left")
-        add_tooltip(btn_reload_cfg,
-                    "Reload users and tasks from config/users.txt and config/tasks.txt.")
 
         # (template label is shown in the header bar above)
 
@@ -4749,16 +4727,11 @@ class App:
                               command=self.save_activity, style="Accent.TButton")
         btn_save.pack(side="left", padx=(0, 6))
 
-        add_tooltip(btn_save, "Add or update the selected entry.")
+        add_tooltip(btn_save, "Add the entry, or save the changes to the entry being edited.")
 
-        btn_del = ttk.Button(btn_row, text="🗑  Delete (Del)", command=self.delete_selected)
-        btn_del.pack(side="left", padx=(0, 20))
-        add_tooltip(btn_del, "Permanently delete the selected entry.")
-
-        btn_nw = ttk.Button(btn_row, text="📅  Next-week plan",
-                            command=self.open_next_week_editor)
-        btn_nw.pack(side="left")
-        add_tooltip(btn_nw, "Edit planned activities for next week.")
+        btn_new = ttk.Button(btn_row, text="✚  New entry", command=self.new_entry)
+        btn_new.pack(side="left")
+        add_tooltip(btn_new, "Clear the form for a new entry (stops editing the selected one).")
 
 
         # ── Divider ─────────────────────────────────────────────────────────
@@ -4780,6 +4753,9 @@ class App:
         self._counter_var = tk.StringVar(value="")
         ttk.Label(sf, textvariable=self._counter_var,
                   font=("Segoe UI", 8), foreground=FG_DIM).pack(side="right", padx=(0, 8))
+        btn_del = ttk.Button(sf, text="🗑  Delete selected", command=self.delete_selected)
+        btn_del.pack(side="right", padx=(0, 16))
+        add_tooltip(btn_del, "Delete the entry selected in the table (also the Delete key, or right click).")
 
         # ── Treeview ────────────────────────────────────────────────────────
         # Pack bottom FIRST so it always stays visible above the taskbar
@@ -4838,7 +4814,7 @@ class App:
 
         # Two rows, one per period: label, period selector, four actions in
         # columns of the same width, then Exit. Export/Import are in File.
-        for col in (2, 3, 4, 5):
+        for col in (2, 3, 4, 5, 6):
             bottom.columnconfigure(col, uniform="actions")
         bold = ("Segoe UI", 9, "bold")
 
@@ -4879,7 +4855,9 @@ class App:
         _action(0, 3, "⟳  Current week", self.load_current_week, "Return to the current week's entries.")
         self._btn_save_cw = _action(0, 4, "💾  Save week", self.save_current_week_button,
                                     "Save the current table back to the weekly archive.")
-        _action(0, 5, "📋  Weekly summary", self.weekly,
+        _action(0, 5, "📅  Next-week plan", self.open_next_week_editor,
+                "Plan next week's activities: they go into the weekly summary.")
+        _action(0, 6, "📋  Weekly summary", self.weekly,
                 "Generate the weekly summary text of the selected CW. Uses the next-week plan if saved.")
 
         # ── Row 1: the month ────────────────────────────────────────────────
@@ -4895,13 +4873,15 @@ class App:
         _action(1, 3, "📂  Open report…", self.open_monthly_report,
                 "Open a previously generated monthly Word report.")
         _action(1, 4, "📊  Statistics", self.show_stats, "Show monthly statistics by user, task and project.")
-        _action(1, 5, "⚙  Report parameters", self.open_report_params,
+        _action(1, 5, "📈  Task trend", self.show_trend,
+                "Effort per task over several months, with a chart.")
+        _action(1, 6, "⚙  Report parameters", self.open_report_params,
                 "Cover-page values of the monthly report: contract, purchase order, "
                 "WP, Service Level Manager, EUM Technical Officer.")
 
-        ttk.Separator(bottom, orient="vertical").grid(row=0, column=6, rowspan=2, sticky="ns", padx=(8, 8))
+        ttk.Separator(bottom, orient="vertical").grid(row=0, column=7, rowspan=2, sticky="ns", padx=(8, 8))
         btn_exit = ttk.Button(bottom, text="✖  Exit", command=self.on_close, style="Danger.TButton")
-        btn_exit.grid(row=0, column=7, rowspan=2, padx=(0, 4), sticky="ns")
+        btn_exit.grid(row=0, column=8, rowspan=2, padx=(0, 4), sticky="ns")
         add_tooltip(btn_exit, "Close the application.")
 
         # ── Status bar — packed last at very bottom ──────────────────────────
@@ -4912,10 +4892,12 @@ class App:
         tk.Label(status_bar, textvariable=self._status_var,
                  anchor="w", fg=ACCENT, bg=BG_HEADER,
                  font=("Segoe UI", 8), padx=12).pack(side="left", fill="y")
-        # Version tag right side
-        tk.Label(status_bar, text=APP_TITLE,
+        # Working folder on the right (changed with File → Working folder…)
+        tk.Label(status_bar, textvariable=self._io_dir_var,
                  anchor="e", fg="#7d9db5", bg=BG_HEADER,
-                 font=("Segoe UI", 7), padx=12).pack(side="right", fill="y")
+                 font=("Segoe UI", 8), padx=12).pack(side="right", fill="y")
+        tk.Label(status_bar, text="📁 Working folder:", anchor="e", fg="#7d9db5", bg=BG_HEADER,
+                 font=("Segoe UI", 8)).pack(side="right", fill="y")
 
         self.update_task_state()
         self._mark_clean()   # baseline for the unsaved-changes check
@@ -5376,6 +5358,18 @@ class App:
         self.desc.insert("1.0", a.get("description", ""))
         self._mark_clean()
         self.update_task_state()
+
+    def new_entry(self) -> None:
+        """Empty form for a new entry: stops editing the selected one (asks first
+        if the form has unsaved changes)."""
+        if self._form_dirty() and not messagebox.askyesno(
+                "New entry", "The form has unsaved changes.\nDiscard them?"):
+            return
+        self.cancel_edit(clear_desc=True)
+        self._pending_duplicate_idx = None
+        self.tree.selection_remove(*self.tree.selection())
+        self.desc.focus_set()
+        self._status("New entry: fill in the form and click Save entry.")
 
     def cancel_edit(self, clear_desc: bool = False) -> None:
         if not clear_desc and self._form_dirty() and self.edit_index is not None:
@@ -6457,11 +6451,12 @@ in the same folder as the executable.
 
 The tool loads it automatically on startup. The header bar
 shows "✔  Template loaded" when ready. You can also load it
-manually via "📂 Select Word template".
+manually via File → Word template….
 
-Set the Working folder (📁 button, top-left) to point
+Set the Working folder (File → Working folder…) to point
 to the shared network folder where weekly archives are stored.
-This setting is remembered across sessions.
+This setting is remembered across sessions; the folder in use
+is shown at the bottom right of the window.
 
 ──────────────────────────────────────────────────────────────
 2. LOGGING ACTIVITIES (daily use)
@@ -6488,9 +6483,11 @@ Fill in the form at the top of the window:
 Click "💾 Save entry" (Ctrl+S) to add the entry to the table.
 
 To edit: double-click a row, make changes, Save again.
+To start a new entry instead: "✚ New entry" (clears the form).
 To duplicate: right-click → Duplicate. The entry is copied into the
 form as a NEW entry; adjust it and click Save entry to add it.
-To delete: select a row and press Delete.
+To delete: select a row and press Delete, or "🗑 Delete selected"
+above the table.
 To undo: press Ctrl+Z (up to 20 levels).
 
 ──────────────────────────────────────────────────────────────
@@ -6498,7 +6495,7 @@ To undo: press Ctrl+Z (up to 20 levels).
 ──────────────────────────────────────────────────────────────
 At the end of each week:
 
-  1. (Optional) Open Edit → Next-week plan to enter planned
+  1. (Optional) Click "📅 Next-week plan" (row Week) to enter planned
      activities for the coming week. The plan is included
      automatically in the generated summary.
   2. Set the Year and CW (calendar week) in the bottom bar.
@@ -6540,8 +6537,8 @@ Manager, EUM Technical Officer) are set with "⚙ Report parameters"
 (also Edit > Report parameters…). They are saved for everybody in
 config/report_params.txt; an empty field keeps the template's text.
 
-Effort over several months: View → Task trend… (or the button
-at the bottom of the Statistics window). It shows a task × month
+Effort over several months: "📈 Task trend" (row Month), View →
+Task trend…, or the button at the bottom of the Statistics window. It shows a task × month
 table coloured by effort (SLM excluded), with a chart of the task
 you click (or of all tasks). Filter by period, user and WP, and
 use "Export to Excel" for the table with a ready-made chart.
@@ -6553,7 +6550,7 @@ use "Export to Excel" for the table with a ready-made chart.
 SCENARIO A — Shared network folder (recommended for teams):
   • The executable and all data live in one shared folder.
   • Only one user can have the tool open at a time (lock file).
-  • Set 📁 Working folder to the shared folder itself.
+  • Set the Working folder (File menu) to the shared folder itself.
   • All users read/write the same weekly_reports/ archive.
   • No manual data exchange needed.
   • Open the tool via launch.bat (sets correct working directory).
@@ -6572,7 +6569,7 @@ SCENARIO B — Local copies + manual sync:
 ──────────────────────────────────────────────────────────────
 6. IMPORT/EXPORT FOLDER
 ──────────────────────────────────────────────────────────────
-The 📁 Working folder setting controls where:
+The Working folder setting (File menu) controls where:
   • Weekly archives (weekly_reports/) are read and written
   • Export and Import file dialogs open by default
   • The monthly Word report reads its source data from
@@ -6651,7 +6648,7 @@ If a newer version is available:
     the new version
 
 If no Working folder is set yet:
-  • Set the Working folder with 📁 — the version check runs
+  • Set the Working folder (File menu) — the version check runs
     immediately after, no restart needed
 
 Note: the version shown in the header is the version of the
