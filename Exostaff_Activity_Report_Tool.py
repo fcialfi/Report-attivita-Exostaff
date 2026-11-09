@@ -4484,7 +4484,7 @@ class App:
         self._update_archive_notice()
 
     def _update_archive_notice(self) -> None:
-        """"● N changes not in the week archive yet  [Save week]" next to Save entry."""
+        """"● N changes not in the week archive yet — Save week below" next to Save entry."""
         if not hasattr(self, "_archive_notice"):
             return
         try:
@@ -4493,7 +4493,8 @@ class App:
             log.warning("pending_archive_changes: %s", exc)
             n = 0
         if n:
-            self._archive_notice_var.set(f"● {n} change{'s' if n > 1 else ''} not in the week archive yet")
+            self._archive_notice_var.set(f"● {n} change{'s' if n > 1 else ''} not in the week archive yet "
+                                         "— 💾 Save week below")
             self._archive_notice.pack(side="left", padx=(28, 0))
         else:
             self._archive_notice.pack_forget()
@@ -4813,12 +4814,6 @@ class App:
         self._archive_notice_var = tk.StringVar()
         ttk.Label(self._archive_notice, textvariable=self._archive_notice_var, foreground="#e07b00",
                   font=("Segoe UI", 9, "bold")).pack(side="left", padx=(0, 8))
-        btn_save_week2 = ttk.Button(self._archive_notice, text="💾  Save week",
-                                    command=self.save_current_week_button, style="Accent.TButton")
-        btn_save_week2.pack(side="left")
-        add_tooltip(btn_save_week2, "Save the table to the weekly archive (same as Save week below). "
-                                    "Needed before loading another week; the monthly report, the "
-                                    "statistics and the suggestions read the archive.")
 
 
         # ── Divider ─────────────────────────────────────────────────────────
