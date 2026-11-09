@@ -4007,16 +4007,6 @@ class App:
                   background=[("active", BG_ENTRY), ("pressed", BORDER)],
                   relief=[("pressed", "flat")])
 
-        # Bottom bar, by function: green = makes a document, lilac = to look at
-        tints = ({"Doc": ("#1f3d2b", "#2a5239", "#cfe9d6"), "Look": ("#2f2a45", "#3d3659", "#ddd5f5")}
-                 if DARK else
-                 {"Doc": ("#dff3e4", "#c8eacf", "#1d5e33"), "Look": ("#ece6fb", "#ddd3f7", "#4a3a86")})
-        for name, (bg, active, fg) in tints.items():
-            style.configure(f"{name}.TButton", font=FONT_UI, padding=(8, 4),
-                            background=bg, foreground=fg, relief="flat", borderwidth=1)
-            style.map(f"{name}.TButton", background=[("active", active), ("pressed", active)],
-                      relief=[("pressed", "flat")])
-
         # Danger button
         style.configure("Danger.TButton",
                          font=FONT_BOLD, padding=(10, 5),
@@ -4900,8 +4890,8 @@ class App:
             bottom.columnconfigure(col, uniform="actions")
         bold = ("Segoe UI", 9, "bold")
 
-        def _action(row, col, text, command, tip, style="TButton"):
-            btn = ttk.Button(bottom, text=text, command=command, style=style)
+        def _action(row, col, text, command, tip):
+            btn = ttk.Button(bottom, text=text, command=command)
             btn.grid(row=row, column=col, sticky="we", padx=(0, 4), pady=(0 if row == 0 else 4, 0))
             add_tooltip(btn, tip)
             return btn
@@ -4937,12 +4927,10 @@ class App:
         _action(0, 3, "⟳  Current week", self.load_current_week, "Return to the current week's entries.")
         self._btn_save_cw = _action(0, 4, "💾  Save week", self.save_current_week_button,
                                     "Save the current table back to the weekly archive.")
-        # green: makes a document; lilac: to look at (Doc / Look styles)
         _action(0, 5, "📅  Next-week plan", self.open_next_week_editor,
-                "Plan next week's activities: they go into the weekly summary.", "Doc.TButton")
+                "Plan next week's activities: they go into the weekly summary.")
         _action(0, 6, "📋  Weekly summary", self.weekly,
-                "Generate the weekly summary text of the selected CW. Uses the next-week plan if saved.",
-                "Doc.TButton")
+                "Generate the weekly summary text of the selected CW. Uses the next-week plan if saved.")
 
         # ── Row 1: the month ────────────────────────────────────────────────
         ttk.Label(bottom, text="Month", font=bold).grid(row=1, column=0, sticky="w", padx=(0, 10), pady=(4, 0))
@@ -4977,14 +4965,12 @@ class App:
         self._month_label_var.set(month_label_of(self.month_var.get()))
 
         _action(1, 2, "📄  Monthly Word", self.monthly,
-                "Aggregate all weekly archives for the selected month and fill the Word template.",
-                "Doc.TButton")
+                "Aggregate all weekly archives for the selected month and fill the Word template.")
         _action(1, 3, "📂  Open report…", self.open_monthly_report,
-                "Open a previously generated monthly Word report.", "Look.TButton")
-        _action(1, 4, "📊  Statistics", self.show_stats, "Show monthly statistics by user, task and project.",
-                "Look.TButton")
+                "Open a previously generated monthly Word report.")
+        _action(1, 4, "📊  Statistics", self.show_stats, "Show monthly statistics by user, task and project.")
         _action(1, 5, "📈  Task trend", self.show_trend,
-                "Effort per task over several months, with a chart.", "Look.TButton")
+                "Effort per task over several months, with a chart.")
 
         ttk.Separator(bottom, orient="vertical").grid(row=0, column=7, rowspan=2, sticky="ns", padx=(8, 8))
         btn_exit = ttk.Button(bottom, text="✖  Exit", command=self.on_close, style="Danger.TButton")
