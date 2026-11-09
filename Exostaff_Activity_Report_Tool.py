@@ -246,7 +246,67 @@ def get_latest_exe_path() -> tuple[Path | None, str]:
         return None, (f"{name} is not (yet) available in:\n{d}\n\n"
                       "If the folder is synced by OneDrive, the new version may still "
                       "be downloading — try again in a few minutes.")
+    # EXE_SHA256.txt (written by build.bat): the exe must be the new one, not the
+    # old one still there because OneDrive synced VERSION.txt first
+    for folder in dict.fromkeys([d, exe.parent]):
+        try:
+            expected = (folder / "EXE_SHA256.txt").read_text(encoding="utf-8-sig").split()[0].lower()
+        except (OSError, IndexError):
+            continue
+        if file_sha256(exe) != expected:
+            return None, (f"{name} in:\n{exe.parent}\nis not the new version yet.\n\n"
+                          "If the folder is synced by OneDrive, the new version may still "
+                          "be downloading — try again in a few minutes.")
+        break
     return exe, ""
+
+
+def file_sha256(path: Path) -> str:
+    import hashlib
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for block in iter(lambda: f.read(1 << 20), b""):
+            h.update(block)
+    return h.hexdigest()
+
+
+_VERSION_SUFFIX = re.compile(r"_(\d+\.\d+\.\d+)$")
+
+
+def updated_exe_path(current: Path, published: str) -> Path:
+    """Where the new exe goes: in place of the running one. A name that carries
+    a version (ActivityReportTool_1.2.2.exe, copied by hand from an older
+    release) takes the name of the published exe (ActivityReportTool.exe), so
+    that it does not keep saying an old version; any other name stays."""
+    if _VERSION_SUFFIX.search(current.stem):
+        return current.with_name(published)
+    return current
+
+
+def update_launcher_script(tmp: Path, dst: Path, target: Path) -> str:
+    """Batch file run after the tool closes: puts the new exe (tmp) at target,
+    removing the old one (dst) when the name changes. Retries for up to ~60 s:
+    a --onefile exe can stay locked for a while after the window closes
+    (temp-dir cleanup, antivirus scan). Does NOT restart the tool (avoids the
+    DLL-in-use error of --onefile): the user reopens it."""
+    if target == dst:
+        steps = (f'move /y "{tmp}" "{dst}" >nul 2>&1\r\n'
+                 'if not errorlevel 1 goto done\r\n')
+    else:
+        steps = (f'if exist "{tmp}" move /y "{tmp}" "{target}" >nul 2>&1\r\n'
+                 f'if exist "{dst}" del /f "{dst}" >nul 2>&1\r\n'
+                 f'if not exist "{tmp}" if not exist "{dst}" goto done\r\n')
+    return ('@echo off\r\n'
+            'chcp 65001 >nul\r\n'
+            'set /a n=0\r\n'
+            ':retry\r\n'
+            'timeout /t 2 /nobreak >nul\r\n'
+            + steps +
+            'set /a n+=1\r\n'
+            'if %n% lss 30 goto retry\r\n'
+            'exit /b 1\r\n'
+            ':done\r\n'
+            'del "%~f0"\r\n')
 
 
 def auto_update(on_progress=None) -> tuple[bool, str]:
@@ -287,26 +347,10 @@ def auto_update(on_progress=None) -> tuple[bool, str]:
     except Exception as exc:
         return False, f"Failed to copy new exe:\n{exc}"
 
-    # Write launcher bat: waits for this process to exit, then renames
-    # Does NOT restart automatically — user must reopen manually
-    # (avoids DLL-in-use error with --onefile)
-    # Retries for up to ~60 s: a --onefile exe can stay locked for a while
-    # after the window closes (temp-dir cleanup, antivirus scan).
+    # Launcher bat: waits for this process to exit, then puts the new exe in place
+    target = updated_exe_path(dst, src.name)
     launcher = dst.parent / "_update_launcher.bat"
-    bat = (
-        '@echo off\r\n'
-        'chcp 65001 >nul\r\n'
-        'set /a n=0\r\n'
-        ':retry\r\n'
-        'timeout /t 2 /nobreak >nul\r\n'
-        f'move /y "{tmp}" "{dst}" >nul 2>&1\r\n'
-        'if not errorlevel 1 goto done\r\n'
-        'set /a n+=1\r\n'
-        'if %n% lss 30 goto retry\r\n'
-        'exit /b 1\r\n'
-        ':done\r\n'
-        'del "%~f0"\r\n'
-    )
+    bat = update_launcher_script(tmp, dst, target)
     import subprocess
     try:
         launcher.write_bytes(bat.encode("utf-8"))
@@ -318,7 +362,7 @@ def auto_update(on_progress=None) -> tuple[bool, str]:
         tmp.unlink(missing_ok=True)
         return False, (f"Could not prepare the update in:\n{dst.parent}\n\n{exc}\n\n"
                        "Copy the new exe by hand from the shared folder.")
-    return True, f"ok_close:{dst}"
+    return True, f"ok_close:{target}"
 
 
 def config_dir() -> Path:
@@ -6820,12 +6864,16 @@ will show the new version number on next launch.
                 if ok and msg.startswith("ok_close:"):
                     exe_path = msg.split(":", 1)[1]
                     exe_dir  = str(Path(exe_path).parent)
+                    renamed = Path(exe_path).name != Path(sys.executable).name
                     def _finish(p=exe_path, d=exe_dir):
                         messagebox.showinfo(
                             "Update ready",
                             f"New version downloaded successfully!\n\n"
                             f"Saved to:\n{p}\n\n"
-                            f"The application will now close.\n"
+                            + (f"It replaces {Path(sys.executable).name}, which is removed: "
+                               f"if you start the tool from a shortcut, point it to the new "
+                               f"file.\n\n" if renamed else "")
+                            + f"The application will now close.\n"
                             f"Reopen it from:\n{d}",
                             parent=win,
                         )

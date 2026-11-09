@@ -255,3 +255,36 @@ def test_recent_archived_entries(tool):
     T.write_week_archive(2026, 43, [entry("2026-10-19", "recent")])
     T.write_week_archive(2025, 10, [entry("2025-03-03", "too old")])
     assert [a["description"] for a in T.recent_archived_entries()] == ["recent"]
+
+
+def test_update_exe_name_and_fingerprint(tool):
+    from pathlib import Path
+    T = tool
+    exe = Path("C:/Tools/ActivityReportTool_1.2.2.exe")
+    # a local copy named with an old version takes the published name
+    assert T.updated_exe_path(exe, "ActivityReportTool.exe") == Path("C:/Tools/ActivityReportTool.exe")
+    plain = Path("C:/Tools/My tool.exe")
+    assert T.updated_exe_path(plain, "ActivityReportTool.exe") == plain   # any other name stays
+    tmp = exe.with_name("ActivityReportTool_1.2.2_new.exe")
+    new = Path("C:/Tools/ActivityReportTool.exe")
+    bat = T.update_launcher_script(tmp, exe, new)
+    assert 'move /y "' + str(tmp) + '" "' + str(new) + '"' in bat
+    assert 'del /f "' + str(exe) + '"' in bat and "goto retry" in bat   # old name removed, with retries
+    same = T.update_launcher_script(tmp, plain, plain)
+    assert "del /f" not in same and 'move /y "' + str(tmp) + '" "' + str(plain) + '"' in same
+
+
+def test_update_waits_for_the_new_exe(tool):
+    T = tool
+    rel = T.share
+    (rel / "VERSION.txt").write_text("9.9.9", encoding="utf-8")
+    (rel / "EXE_LOCATION.txt").write_text("C:\\Users\\Cialfi\\x\\ActivityReportTool.exe\n", encoding="utf-8")
+    (rel / "ActivityReportTool.exe").write_bytes(b"old build")
+    (rel / "EXE_SHA256.txt").write_text(T.file_sha256(rel / "ActivityReportTool.exe") + "\n", encoding="utf-8")
+    exe, err = T.get_latest_exe_path()
+    assert exe == rel / "ActivityReportTool.exe" and not err
+    (rel / "EXE_SHA256.txt").write_text("0" * 64 + "\n", encoding="utf-8")   # VERSION synced, exe not yet
+    exe, err = T.get_latest_exe_path()
+    assert exe is None and "not the new version yet" in err
+    (rel / "EXE_SHA256.txt").unlink()   # releases made before the fingerprint: as before
+    assert T.get_latest_exe_path()[0] == rel / "ActivityReportTool.exe"

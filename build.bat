@@ -86,28 +86,29 @@ echo %NEW_VERSION%> "%DIST_DIR%\VERSION.txt"
 echo  [INFO] Deploying...
 if not exist "%EXE_SHARE%" mkdir "%EXE_SHARE%"
 
-:: Versioned copy: EXE_LOCATION points to it, so a PC where OneDrive has
-:: synced VERSION.txt but not yet the new exe cannot "update" to the old one.
+:: One exe, without version in the name. EXE_SHA256.txt holds its fingerprint:
+:: a PC where OneDrive has synced VERSION.txt but not yet the new exe sees that
+:: the exe there is still the old one and waits, instead of "updating" to it.
 del /q "%EXE_SHARE%\%APP_NAME%_*.exe" 2>nul
-copy /y "%DIST_DIR%\%APP_NAME%.exe" "%EXE_SHARE%\%APP_NAME%_%NEW_VERSION%.exe" >nul
-if errorlevel 1 ( echo [ERROR] Copy exe failed. Check network. & pause & exit /b 1 )
-:: Plain name for new users downloading by hand
 copy /y "%DIST_DIR%\%APP_NAME%.exe" "%EXE_SHARE%\%APP_NAME%.exe" >nul
-if errorlevel 1 ( echo [WARN] %APP_NAME%.exe is in use - only the versioned copy was updated. )
-echo  [OK] Exe deployed.
+if errorlevel 1 ( echo [ERROR] Copy exe failed: %APP_NAME%.exe in use from the shared folder, or network. & pause & exit /b 1 )
+python -c "import hashlib,sys; print(hashlib.sha256(open(sys.argv[1],'rb').read()).hexdigest())" "%DIST_DIR%\%APP_NAME%.exe" > "%DATA_SHARE%\EXE_SHA256.txt"
+if errorlevel 1 ( echo [ERROR] EXE_SHA256.txt not written. & pause & exit /b 1 )
+echo %EXE_SHARE%\%APP_NAME%.exe> "%DATA_SHARE%\EXE_LOCATION.txt"
+echo  [OK] Exe deployed: %APP_NAME%.exe, EXE_SHA256.txt, EXE_LOCATION.txt
 
+:: VERSION.txt last: it is what tells the users a new version is out
 copy /y "%DIST_DIR%\VERSION.txt" "%DATA_SHARE%\VERSION.txt" >nul
 if errorlevel 1 ( echo [ERROR] VERSION.txt copy failed - users will NOT be notified. & pause & exit /b 1 )
 echo  [OK] VERSION.txt updated.
 
-echo %EXE_SHARE%\%APP_NAME%_%NEW_VERSION%.exe> "%DATA_SHARE%\EXE_LOCATION.txt"
-echo  [OK] EXE_LOCATION.txt updated.
 :: The tool looks for VERSION.txt in the exe folder first (RELEASE_DIR):
 :: publish it there too when the exe and data folders differ
 if /i not "%EXE_SHARE%"=="%DATA_SHARE%" (
-    copy /y "%DIST_DIR%\VERSION.txt" "%EXE_SHARE%\VERSION.txt" >nul
+    copy /y "%DATA_SHARE%\EXE_SHA256.txt" "%EXE_SHARE%\EXE_SHA256.txt" >nul
     copy /y "%DATA_SHARE%\EXE_LOCATION.txt" "%EXE_SHARE%\EXE_LOCATION.txt" >nul
-    echo  [OK] VERSION.txt and EXE_LOCATION.txt also in the exe folder.
+    copy /y "%DIST_DIR%\VERSION.txt" "%EXE_SHARE%\VERSION.txt" >nul
+    echo  [OK] VERSION.txt, EXE_LOCATION.txt and EXE_SHA256.txt also in the exe folder.
 )
 
 set TEMPLATE=EPS-Sterna and EPS-Aeolus System Engineering Service Template.docx
