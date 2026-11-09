@@ -73,8 +73,18 @@ pip install python-docx lxml openpyxl --quiet >> %LOG_FILE% 2>&1
 echo  [OK] Dependencies ready.
 
 :: ── Clean ───────────────────────────────────────────────────────────────
+:: An exe started from the build folder (to try it) locks it: PyInstaller then
+:: fails at the end ("_append_data_to_exe failed"). Close only those copies,
+:: not the tool someone is using from another folder.
+powershell -NoProfile -Command "Get-Process -Name '%APP_NAME%' -ErrorAction SilentlyContinue | Where-Object { $_.Path -like '%BUILD_ROOT%\*' } | ForEach-Object { Write-Host ('  [INFO] Closing ' + $_.Path); Stop-Process -Id $_.Id -Force }"
+timeout /t 1 /nobreak >nul
 if exist "%BUILD_DIR%" rmdir /s /q "%BUILD_DIR%"
 if exist "%DIST_DIR%"  rmdir /s /q "%DIST_DIR%"
+if exist "%DIST_DIR%\%APP_NAME%.exe" (
+    echo [ERROR] %DIST_DIR%\%APP_NAME%.exe is in use and cannot be replaced.
+    echo         Close it ^(also in Task Manager^) or wait for the antivirus, then run build.bat again.
+    pause & exit /b 1
+)
 if not exist "%BUILD_ROOT%" mkdir "%BUILD_ROOT%"
 if exist %APP_NAME%.spec del %APP_NAME%.spec
 
@@ -82,7 +92,11 @@ if exist %APP_NAME%.spec del %APP_NAME%.spec
 echo.
 echo  [INFO] Building exe...
 python -m PyInstaller --onefile --windowed --name "%APP_NAME%" --icon "assets\exostaff_icon.ico" --add-data "assets;assets" --add-data "build_info.json;." --distpath "%DIST_DIR%" --workpath "%BUILD_DIR%" --clean %SCRIPT% >> %LOG_FILE% 2>&1
-if errorlevel 1 ( echo [ERROR] Build FAILED. See %LOG_FILE%. & pause & exit /b 1 )
+if errorlevel 1 (
+    echo [ERROR] Build FAILED. See %LOG_FILE%.
+    findstr /c:"_append_data_to_exe" %LOG_FILE% >nul && echo         The new exe could not be written: the antivirus was probably scanning it. Run build.bat again.
+    pause & exit /b 1
+)
 echo  [OK] Build successful.
 
 :: ── Write VERSION.txt ───────────────────────────────────────────────────
