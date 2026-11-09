@@ -246,7 +246,67 @@ def get_latest_exe_path() -> tuple[Path | None, str]:
         return None, (f"{name} is not (yet) available in:\n{d}\n\n"
                       "If the folder is synced by OneDrive, the new version may still "
                       "be downloading — try again in a few minutes.")
+    # EXE_SHA256.txt (written by build.bat): the exe must be the new one, not the
+    # old one still there because OneDrive synced VERSION.txt first
+    for folder in dict.fromkeys([d, exe.parent]):
+        try:
+            expected = (folder / "EXE_SHA256.txt").read_text(encoding="utf-8-sig").split()[0].lower()
+        except (OSError, IndexError):
+            continue
+        if file_sha256(exe) != expected:
+            return None, (f"{name} in:\n{exe.parent}\nis not the new version yet.\n\n"
+                          "If the folder is synced by OneDrive, the new version may still "
+                          "be downloading — try again in a few minutes.")
+        break
     return exe, ""
+
+
+def file_sha256(path: Path) -> str:
+    import hashlib
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for block in iter(lambda: f.read(1 << 20), b""):
+            h.update(block)
+    return h.hexdigest()
+
+
+_VERSION_SUFFIX = re.compile(r"_(\d+\.\d+\.\d+)$")
+
+
+def updated_exe_path(current: Path, published: str) -> Path:
+    """Where the new exe goes: in place of the running one. A name that carries
+    a version (ActivityReportTool_1.2.2.exe, copied by hand from an older
+    release) takes the name of the published exe (ActivityReportTool.exe), so
+    that it does not keep saying an old version; any other name stays."""
+    if _VERSION_SUFFIX.search(current.stem):
+        return current.with_name(published)
+    return current
+
+
+def update_launcher_script(tmp: Path, dst: Path, target: Path) -> str:
+    """Batch file run after the tool closes: puts the new exe (tmp) at target,
+    removing the old one (dst) when the name changes. Retries for up to ~60 s:
+    a --onefile exe can stay locked for a while after the window closes
+    (temp-dir cleanup, antivirus scan). Does NOT restart the tool (avoids the
+    DLL-in-use error of --onefile): the user reopens it."""
+    if target == dst:
+        steps = (f'move /y "{tmp}" "{dst}" >nul 2>&1\r\n'
+                 'if not errorlevel 1 goto done\r\n')
+    else:
+        steps = (f'if exist "{tmp}" move /y "{tmp}" "{target}" >nul 2>&1\r\n'
+                 f'if exist "{dst}" del /f "{dst}" >nul 2>&1\r\n'
+                 f'if not exist "{tmp}" if not exist "{dst}" goto done\r\n')
+    return ('@echo off\r\n'
+            'chcp 65001 >nul\r\n'
+            'set /a n=0\r\n'
+            ':retry\r\n'
+            'timeout /t 2 /nobreak >nul\r\n'
+            + steps +
+            'set /a n+=1\r\n'
+            'if %n% lss 30 goto retry\r\n'
+            'exit /b 1\r\n'
+            ':done\r\n'
+            'del "%~f0"\r\n')
 
 
 def auto_update(on_progress=None) -> tuple[bool, str]:
@@ -287,26 +347,10 @@ def auto_update(on_progress=None) -> tuple[bool, str]:
     except Exception as exc:
         return False, f"Failed to copy new exe:\n{exc}"
 
-    # Write launcher bat: waits for this process to exit, then renames
-    # Does NOT restart automatically — user must reopen manually
-    # (avoids DLL-in-use error with --onefile)
-    # Retries for up to ~60 s: a --onefile exe can stay locked for a while
-    # after the window closes (temp-dir cleanup, antivirus scan).
+    # Launcher bat: waits for this process to exit, then puts the new exe in place
+    target = updated_exe_path(dst, src.name)
     launcher = dst.parent / "_update_launcher.bat"
-    bat = (
-        '@echo off\r\n'
-        'chcp 65001 >nul\r\n'
-        'set /a n=0\r\n'
-        ':retry\r\n'
-        'timeout /t 2 /nobreak >nul\r\n'
-        f'move /y "{tmp}" "{dst}" >nul 2>&1\r\n'
-        'if not errorlevel 1 goto done\r\n'
-        'set /a n+=1\r\n'
-        'if %n% lss 30 goto retry\r\n'
-        'exit /b 1\r\n'
-        ':done\r\n'
-        'del "%~f0"\r\n'
-    )
+    bat = update_launcher_script(tmp, dst, target)
     import subprocess
     try:
         launcher.write_bytes(bat.encode("utf-8"))
@@ -318,7 +362,7 @@ def auto_update(on_progress=None) -> tuple[bool, str]:
         tmp.unlink(missing_ok=True)
         return False, (f"Could not prepare the update in:\n{dst.parent}\n\n{exc}\n\n"
                        "Copy the new exe by hand from the shared folder.")
-    return True, f"ok_close:{dst}"
+    return True, f"ok_close:{target}"
 
 
 def config_dir() -> Path:
@@ -4112,9 +4156,9 @@ class App:
 
         # File
         m_file = tk.Menu(menubar, tearoff=0)
-        m_file.add_command(label="Export CSV/JSON…",      command=self.export_table)
-        m_file.add_command(label="Export Excel (.xlsx)…",  command=self.export_xlsx)
-        m_file.add_command(label="Import CSV/JSON…",       command=self.import_table)
+        m_file.add_command(label="Export table (CSV/JSON)…", command=self.export_table)
+        m_file.add_command(label="Export table to Excel…",   command=self.export_xlsx)
+        m_file.add_command(label="Import entries from another user (CSV/JSON)…", command=self.import_table)
         m_file.add_separator()
         m_file.add_command(label="Set working folder…", command=self.choose_io_dir)
         m_file.add_separator()
@@ -4792,10 +4836,22 @@ class App:
         today = date.today()
         iso   = today.isocalendar()
 
-        # ── Row 0: Weekly controls ───────────────────────────────────────────
-        # Week selector — compact inline frame
+        # Two rows, one per period: label, period selector, four actions in
+        # columns of the same width, then Exit. Export/Import are in File.
+        for col in (2, 3, 4, 5):
+            bottom.columnconfigure(col, uniform="actions")
+        bold = ("Segoe UI", 9, "bold")
+
+        def _action(row, col, text, command, tip):
+            btn = ttk.Button(bottom, text=text, command=command)
+            btn.grid(row=row, column=col, sticky="we", padx=(0, 4), pady=(0 if row == 0 else 4, 0))
+            add_tooltip(btn, tip)
+            return btn
+
+        # ── Row 0: the week ─────────────────────────────────────────────────
+        ttk.Label(bottom, text="Week", font=bold).grid(row=0, column=0, sticky="w", padx=(0, 10))
         week_frame = ttk.Frame(bottom)
-        week_frame.grid(row=0, column=0, sticky="w", padx=(0, 8))
+        week_frame.grid(row=0, column=1, sticky="w", padx=(0, 12))
 
         ttk.Label(week_frame, text="Year").pack(side="left")
         self.week_year = tk.StringVar(value=str(iso.year))
@@ -4818,55 +4874,32 @@ class App:
         btn_cw_next.bind("<Button-1>", lambda e: self._step_week(+1))
         add_tooltip(btn_cw_next, "Next week")
 
-        btn_load_cw = ttk.Button(bottom, text="📂  Load week", command=self.load_week_into_table)
-        btn_load_cw.grid(row=0, column=1, padx=(0, 4))
-        add_tooltip(btn_load_cw, "Load a specific CW from the archive into the table for editing.")
+        _action(0, 2, "📂  Load week", self.load_week_into_table,
+                "Load a specific CW from the archive into the table for editing.")
+        _action(0, 3, "⟳  Current week", self.load_current_week, "Return to the current week's entries.")
+        self._btn_save_cw = _action(0, 4, "💾  Save week", self.save_current_week_button,
+                                    "Save the current table back to the weekly archive.")
+        _action(0, 5, "📋  Weekly summary", self.weekly,
+                "Generate the weekly summary text of the selected CW. Uses the next-week plan if saved.")
 
-        btn_load_cur = ttk.Button(bottom, text="⟳  Current week", command=self.load_current_week)
-        btn_load_cur.grid(row=0, column=2, padx=(0, 4))
-        add_tooltip(btn_load_cur, "Return to the current week's entries.")
-
-        self._btn_save_cw = ttk.Button(bottom, text="💾  Save week",
-                                       command=self.save_current_week_button)
-        self._btn_save_cw.grid(row=0, column=3, padx=(0, 4))
-        add_tooltip(self._btn_save_cw, "Save the current table back to the weekly archive.")
-
-        btn_weekly = ttk.Button(bottom, text="📋  Generate weekly summary", command=self.weekly)
-        btn_weekly.grid(row=0, column=4, padx=(0, 4))
-        add_tooltip(btn_weekly, "Generate weekly summary text. Uses next-week plan if saved.")
-
-        btn_params = ttk.Button(bottom, text="⚙  Report parameters", command=self.open_report_params)
-        btn_params.grid(row=0, column=5, columnspan=2, sticky="we", padx=(0, 4))
-        add_tooltip(btn_params, "Cover-page values of the monthly report: contract, purchase order, "
-                                "WP, Service Level Manager, EUM Technical Officer.")
-
-        # ── Row 1: Monthly controls + Export/Import + Exit ───────────────────
-        ttk.Label(bottom, text="Month YYYY-MM").grid(row=1, column=0, columnspan=1, sticky="w", pady=(4, 0))
+        # ── Row 1: the month ────────────────────────────────────────────────
+        ttk.Label(bottom, text="Month", font=bold).grid(row=1, column=0, sticky="w", padx=(0, 10), pady=(4, 0))
+        month_frame = ttk.Frame(bottom)
+        month_frame.grid(row=1, column=1, sticky="w", padx=(0, 12), pady=(4, 0))
         self.month_var = tk.StringVar(value=date.today().strftime("%Y-%m"))
-        ttk.Entry(bottom, textvariable=self.month_var, width=10).grid(row=1, column=1, columnspan=1, sticky="w", padx=(2, 6), pady=(4, 0))
+        ttk.Entry(month_frame, textvariable=self.month_var, width=10).pack(side="left")
+        ttk.Label(month_frame, text="YYYY-MM", foreground=FG_DIM).pack(side="left", padx=(6, 0))
 
-        btn_monthly = ttk.Button(bottom, text="📄  Generate monthly Word", command=self.monthly)
-        btn_monthly.grid(row=1, column=2, padx=(0, 4), pady=(4, 0))
-        add_tooltip(btn_monthly, "Aggregate all weekly archives for the selected month and fill the Word template.")
+        _action(1, 2, "📄  Monthly Word", self.monthly,
+                "Aggregate all weekly archives for the selected month and fill the Word template.")
+        _action(1, 3, "📂  Open report…", self.open_monthly_report,
+                "Open a previously generated monthly Word report.")
+        _action(1, 4, "📊  Statistics", self.show_stats, "Show monthly statistics by user, task and project.")
+        _action(1, 5, "⚙  Report parameters", self.open_report_params,
+                "Cover-page values of the monthly report: contract, purchase order, "
+                "WP, Service Level Manager, EUM Technical Officer.")
 
-        btn_open_rpt = ttk.Button(bottom, text="📂  Open report…", command=self.open_monthly_report)
-        btn_open_rpt.grid(row=1, column=3, padx=(0, 4), pady=(4, 0))
-        add_tooltip(btn_open_rpt, "Open a previously generated monthly Word report.")
-
-        btn_stats = ttk.Button(bottom, text="📊  Statistics", command=self.show_stats)
-        btn_stats.grid(row=1, column=4, padx=(0, 4), pady=(4, 0))
-        add_tooltip(btn_stats, "Show monthly statistics by user, task and project.")
-
-        btn_exp = ttk.Button(bottom, text="⬆  Export", command=self._export_menu)
-        btn_exp.grid(row=1, column=5, padx=(0, 4), pady=(4, 0))
-        add_tooltip(btn_exp, "Export current table to CSV, JSON or Excel.")
-
-        btn_imp = ttk.Button(bottom, text="⬇  Import", command=self.import_table)
-        btn_imp.grid(row=1, column=6, padx=(0, 4), pady=(4, 0))
-        add_tooltip(btn_imp, "Import entries from CSV or JSON.")
-
-        ttk.Separator(bottom, orient="vertical").grid(row=0, column=7, rowspan=2, sticky="ns", padx=(12, 8))
-
+        ttk.Separator(bottom, orient="vertical").grid(row=0, column=6, rowspan=2, sticky="ns", padx=(8, 8))
         btn_exit = ttk.Button(bottom, text="✖  Exit", command=self.on_close, style="Danger.TButton")
         btn_exit.grid(row=0, column=7, rowspan=2, padx=(0, 4), sticky="ns")
         add_tooltip(btn_exit, "Close the application.")
@@ -5733,9 +5766,6 @@ class App:
     # Export / import
     # -----------------------------------------------------------------------
 
-    def _export_menu(self) -> None:
-        self.export_table()
-
     def choose_io_dir(self) -> None:
         """Let the user pick the default import/export folder."""
         d = filedialog.askdirectory(
@@ -6472,7 +6502,7 @@ At the end of each week:
      activities for the coming week. The plan is included
      automatically in the generated summary.
   2. Set the Year and CW (calendar week) in the bottom bar.
-  3. Click "📋 Generate weekly summary".
+  3. Click "📋 Weekly summary" (row "Week" of the bottom bar).
   4. Copy to clipboard and paste into your email/Teams message.
 
 The current week's data is automatically archived to
@@ -6498,7 +6528,7 @@ At the end of each month:
      to the shared folder (Scenario A) or exchanged JSON files
      (Scenario B — see section 5).
   2. Set the Month field (YYYY-MM) in the bottom bar.
-  3. Click "📄 Generate monthly Word".
+  3. Click "📄 Monthly Word" (row "Month" of the bottom bar).
   4. Choose where to save the output .docx file.
 
 The tool reads all weekly archives for that month from the
@@ -6532,10 +6562,12 @@ SCENARIO B — Local copies + manual sync:
   • Each user has a local copy of the tool and their own data.
   • No lock conflicts — everyone works independently.
   • To consolidate before the monthly report:
-      Export: "⬆ Export" → JSON → send to the report owner.
-      Import: "⬇ Import" → select received JSON file.
+      Export: File → Export table (CSV/JSON) → JSON → send to
+              the report owner.
+      Import: File → Import entries from another user → select
+              the received JSON file.
       Duplicate entries are skipped automatically.
-  • CSV/XLSX exports are for analysis in Excel only.
+  • CSV/XLSX exports (File menu) are for analysis in Excel only.
 
 ──────────────────────────────────────────────────────────────
 6. IMPORT/EXPORT FOLDER
@@ -6820,12 +6852,16 @@ will show the new version number on next launch.
                 if ok and msg.startswith("ok_close:"):
                     exe_path = msg.split(":", 1)[1]
                     exe_dir  = str(Path(exe_path).parent)
+                    renamed = Path(exe_path).name != Path(sys.executable).name
                     def _finish(p=exe_path, d=exe_dir):
                         messagebox.showinfo(
                             "Update ready",
                             f"New version downloaded successfully!\n\n"
                             f"Saved to:\n{p}\n\n"
-                            f"The application will now close.\n"
+                            + (f"It replaces {Path(sys.executable).name}, which is removed: "
+                               f"if you start the tool from a shortcut, point it to the new "
+                               f"file.\n\n" if renamed else "")
+                            + f"The application will now close.\n"
                             f"Reopen it from:\n{d}",
                             parent=win,
                         )
