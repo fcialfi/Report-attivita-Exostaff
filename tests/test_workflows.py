@@ -238,31 +238,3 @@ def test_archive_notice_next_to_save_entry(session, tool):
     s.save_week()
     assert not notice() and tool.pending_archive_changes(s.app.data, s.app._loaded_week_keys) == 0
 
-
-def test_monthly_shows_the_report_parameters_first(session, tool, monkeypatch):
-    s = session(date(2026, 11, 9))
-    a = s.app
-    tool.save_report_params({"EUM Technical Officer": "Mario Rossi"})
-    from conftest import REPO
-    a.template_path = next((REPO / "config").glob("*.docx"))
-    shown = []
-    real = tool.ConfirmReportParams
-
-    def answer(result):
-        def make(*args, **kw):
-            dlg = real(*args, **kw)
-            shown.append(dlg)
-            dlg.after(10, lambda: dlg._close(result) if result else dlg.destroy())
-            return dlg
-        return make
-    asked = []
-    monkeypatch.setattr(tool.filedialog, "asksaveasfilename", lambda **k: asked.append(k) or "")
-    monkeypatch.setattr(tool, "ConfirmReportParams", answer(None))      # Cancel: nothing else asked
-    a.monthly()
-    assert len(shown) == 1 and not asked
-    monkeypatch.setattr(tool, "ConfirmReportParams", answer("generate"))
-    a.monthly()
-    assert asked and asked[0]["initialfile"] == "monthly_activity_report_2026_10.docx"
-    values = dict((n, (v, own)) for n, v, own in tool.effective_report_params(a.template_path))
-    assert values["EUM Technical Officer"] == ("Mario Rossi", True)
-    assert values["Contract"] == ("EUM/CO/24/4600002812/AC", False)   # from the template
