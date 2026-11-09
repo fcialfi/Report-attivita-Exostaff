@@ -4454,11 +4454,19 @@ class App:
         if event.keysym in ("Up", "Down", "Return", "KP_Enter", "Escape", "Tab") or event.keysym.endswith(
                 ("_L", "_R")):
             return
-        self._show_suggestions()
+        if self.desc.get("1.0", "end").strip():
+            self._show_suggestions()
+        else:
+            self._hide_suggestions()   # nothing typed: no list (↓ shows it)
 
     def _move_suggestion(self, step: int):
         if not self._suggestions_shown():
-            return None   # normal cursor movement in the text
+            # ↓ on the last line opens the list (all of it when nothing is typed);
+            # otherwise the normal cursor movement in the text
+            if step > 0 and self.desc.compare("insert linestart", "==", "end-1c linestart"):
+                self._show_suggestions()
+                return "break" if self._suggestions_shown() else None
+            return None
         lb = self._suggest_list
         cur = lb.curselection()
         k = (cur[0] + step) if cur else (0 if step > 0 else lb.size() - 1)
@@ -4674,11 +4682,11 @@ class App:
                             bg=BG_ENTRY, fg=FG_MAIN)
         self.desc.grid(row=0, column=1, sticky="we")
         # Suggestions under the field: the descriptions already used for the task
-        # (description_suggestions); arrows + Enter or a click take one, Esc closes
+        # (description_suggestions), shown once something is typed or on ↓ (the whole
+        # list); arrows + Enter or a click take one, Esc closes
         self._suggest_pool = None    # archived entries of the last months, read once
         self._suggest_popup = None
         self.desc.bind("<KeyRelease>", self._on_desc_key, add="+")
-        self.desc.bind("<FocusIn>", lambda e: self._show_suggestions(), add="+")
         self.desc.bind("<FocusOut>", lambda e: self.root.after(150, self._hide_suggestions_if_unfocused), add="+")
         self.desc.bind("<Down>", lambda e: self._move_suggestion(1))
         self.desc.bind("<Up>", lambda e: self._move_suggestion(-1))
@@ -4686,8 +4694,8 @@ class App:
         self.desc.bind("<Escape>", lambda e: self._hide_suggestions())
         self.task_var.trace_add("write", lambda *_: self._hide_suggestions())
         self.root.bind("<Configure>", lambda e: self._hide_suggestions() if e.widget is self.root else None, add="+")
-        add_tooltip(self.desc, "Suggestions: descriptions already used for this task. Arrows + Enter or a "
-                               "click to use one, Esc to close. Same words for the same activity = one line "
+        add_tooltip(self.desc, "Suggestions: type, or press ↓ for all the descriptions already used for this "
+                               "task. Arrows + Enter or a click to use one, Esc to close. Same words for the same activity = one line "
                                "in the monthly report.")
 
         btn_row = ttk.Frame(top)
@@ -6438,9 +6446,10 @@ Fill in the form at the top of the window:
                   Warning shown if daily total exceeds 1.0 PD.
   • Task        — select from the list in config/tasks.txt
   • Description — brief description of what was done.
-                  A list under the field suggests the descriptions
-                  already used for the chosen task (by anyone, last
-                  6 months), most used first; typing filters it.
+                  Typing, a list under the field suggests the
+                  descriptions already used for the chosen task (by
+                  anyone, last 6 months) that contain the words typed,
+                  most used first; ↓ in the field shows all of them.
                   ↓/↑ + Enter or a click to use one, Esc to close.
                   Reuse the same words for the same activity: the
                   monthly report then shows it once, not as several

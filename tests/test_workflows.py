@@ -176,13 +176,18 @@ def test_description_suggestions_in_the_form(session, tool):
     a = s.app
     a.wp_var.set("WP6"); a._on_wp_changed(); a.task_var.set("1 - T1")
     a.root.update()
-    a.desc.focus_force(); a.desc.insert("1.0", "gst")
-    a._show_suggestions(); a.root.update()
+    a.desc.focus_force(); a.root.update()
+    assert not a._suggestions_shown()            # entering the field: no list until something is typed
+    a.desc.insert("1.0", "gst")
+    a._on_desc_key(type("E", (), {"keysym": "t"})()); a.root.update()
     assert a._suggest_list.get(0, "end") == ("GSTRACE update",)
     assert a._move_suggestion(1) == "break" and a._accept_suggestion_key() == "break"
     assert a.desc.get("1.0", "end").strip() == "GSTRACE update" and not a._suggestions_shown()
-    a.desc.delete("1.0", "end"); a._show_suggestions()
+    a.desc.delete("1.0", "end"); a._on_desc_key(type("E", (), {"keysym": "BackSpace"})())
+    assert not a._suggestions_shown()            # field emptied: the list closes
+    assert a._move_suggestion(1) == "break"      # ↓: the whole list
     assert set(a._suggest_list.get(0, "end")) == {"GSTRACE update", "Slides for the CDR"}   # task 1 only
+    a._suggest_list.selection_clear(0, "end")
     assert a._accept_suggestion_key() is None   # Enter with nothing chosen: a new line, as before
     a.task_var.set("2 - T2")
     assert not a._suggestions_shown()            # another task: the list closes
