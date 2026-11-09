@@ -453,24 +453,65 @@ def read_config_text(path: Path) -> str:
         return data.decode("cp1252", errors="replace")
 
 
+_YEAR_LINE = re.compile(r"^#?\s*(\d{4})\b")
+# The EUMETSAT list as sent around: "Friday, 24 December pm (1/2 day)<TAB>Christmas Eve"
+_LISTED_DAY = re.compile(r"^(?:[A-Za-z]+,?\s+)?(\d{1,2})\s+([A-Za-z]+)(?:\s+(\d{4}))?\s*(.*?)"
+                         r"(?:\s*\|\s*|\t+|\s{2,})(.+)$")
+
+# Lines of holidays.txt the last load could not read (shown when it is saved)
+holiday_lines_ignored: list[str] = []
+
+
+def parse_holiday_line(line: str, year: int | None) -> tuple[date, str] | None:
+    """(date, description) of one line of holidays.txt, or None.
+
+    "2026-12-25 | Xmas", "2026-12-25<TAB>Xmas", "25/12/2026 Xmas", or as in the
+    EUMETSAT list "Friday, 25 December<TAB>Christmas Day" with the year of the
+    last year line above ("# 2027" or "2027")."""
+    parts = re.split(r"\s*\|\s*|\t+|\s+", line, maxsplit=1)
+    try:
+        return safe_date(parts[0]), parts[1].strip() if len(parts) > 1 else ""
+    except ValueError:
+        pass
+    m = _LISTED_DAY.match(line)
+    if not m:
+        return None
+    day, month, own_year, extra, desc = m.groups()
+    try:
+        month_no = datetime.strptime(month[:3].title(), "%b").month
+        d = date(int(own_year or year), month_no, int(day))
+    except (TypeError, ValueError):
+        return None
+    desc = " ".join(desc.split())
+    extra = " ".join(extra.split())
+    return d, f"{desc}, {extra}" if extra else desc   # "Christmas Eve, pm (1/2 day)"
+
+
 def load_holidays() -> dict[date, str]:
     """Load holidays from config/holidays.txt. Returns {date: description}."""
+    global holiday_lines_ignored
+    holiday_lines_ignored = []
     hf = holidays_file()
     if not hf.exists():
         return {}
     result: dict[date, str] = {}
+    year = None
     for line in read_config_text(hf).splitlines():
-        line = line.strip()
-        if not line or line.startswith("#"):
+        line = line.replace("\u00a0", " ").strip()
+        if not line:
             continue
-        # "2026-12-25 | Xmas", "2026-12-25<TAB>Xmas", "25/12/2026 Xmas"
-        parts = re.split(r"\s*\|\s*|\t+|\s+", line, maxsplit=1)
-        try:
-            d = safe_date(parts[0])
-        except ValueError:
+        m = _YEAR_LINE.match(line)
+        if m and (line.startswith("#") or line == m.group(1)):
+            year = int(m.group(1))   # "# 2027" / "2027": year of the lines below
+            continue
+        if line.startswith("#"):
+            continue
+        found = parse_holiday_line(line, year)
+        if found is None:
             log.warning("holidays.txt: line not understood, ignored: %r", line)
+            holiday_lines_ignored.append(line)
             continue
-        result[d] = parts[1].strip() if len(parts) > 1 else ""
+        result[found[0]] = found[1]
     return result
 
 
@@ -6834,8 +6875,11 @@ will show the new version number on next launch.
                 self.users, self.tasks = reload_config()
                 reload_holidays()
                 self._update_combos()
-                self._status(f"Config saved and reloaded — {len(self.users)} users, {len(self.tasks)} tasks")
+                self._status(f"Config saved and reloaded — {len(self.users)} users, {len(self.tasks)} tasks, "
+                             f"{len(_holidays)} holidays")
                 win.destroy()
+                if filepath == holidays_file() and holiday_lines_ignored:
+                    self._warn_ignored_holidays()
             except Exception as e:
                 messagebox.showerror("Save error", str(e), parent=win)
 
@@ -6878,8 +6922,12 @@ will show the new version number on next launch.
             messagebox.showinfo("Config reloaded",
                 f"Users: {len(self.users)}\n"
                 f"Tasks: {len(self.tasks)}\n"
-                f"Holidays: {len(_holidays)}\n\n"
+                f"Holidays: {len(_holidays)}"
+                + (f" (by year: {', '.join(f'{y}: {n}' for y, n in sorted(Counter(d.year for d in _holidays).items()))})"
+                   if _holidays else "") + "\n\n"
                 "Dropdowns updated.")
+            if holiday_lines_ignored:
+                self._warn_ignored_holidays()
         except Exception as e:
             messagebox.showerror("Config error", str(e))
 
@@ -6899,6 +6947,15 @@ will show the new version number on next launch.
             return
         create_default_config()
         self._open_text_editor(tasks_file(), "Edit Tasks — config/tasks.txt")
+
+    def _warn_ignored_holidays(self) -> None:
+        shown = holiday_lines_ignored[:15]
+        messagebox.showwarning(
+            "Holidays not understood",
+            f"{len(holiday_lines_ignored)} line(s) of holidays.txt were not understood and are ignored:\n\n"
+            + "\n".join(shown) + ("\n…" if len(holiday_lines_ignored) > len(shown) else "")
+            + "\n\nWrite them as 2027-12-25 | Christmas Day, or as \"Friday, 25 December  Christmas Day\" "
+              "under a line # 2027 giving the year.")
 
     def open_holidays_config(self) -> None:
         if not require_io_dir():

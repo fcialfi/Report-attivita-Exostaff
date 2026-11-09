@@ -346,3 +346,30 @@ def test_build_proposes_the_latest_version(tmp_path):
     assert run() == "7.1.0"                                  # built here, not yet published
     (share / "VERSION.txt").write_text("not a version", encoding="utf-8")
     assert run() == "7.1.0"
+
+
+def test_holidays_in_the_eumetsat_list_format(tool):
+    from datetime import date
+    T = tool
+    (T.share / "config" / "holidays.txt").write_text(
+        "# 2026\n2026-12-25 | Christmas Day\n"
+        "# 2027\n"
+        "Friday, 1 January \tNew Year’s Day\n"
+        "\t\n"
+        "Monday, 8 February\tRosenmontag\n"
+        "Friday, 24 December pm (1/2 day)\tChristmas Eve\n"
+        "Friday, 31 December   New Year’s Eve\n"
+        "2027-05-06 | Ascension Day\n"
+        "Someday\tnot a date\n", encoding="utf-8")
+    T.reload_holidays()
+    assert T._holidays[date(2026, 12, 25)] == "Christmas Day"
+    assert T._holidays[date(2027, 1, 1)] == "New Year’s Day"
+    assert T._holidays[date(2027, 2, 8)] == "Rosenmontag"
+    assert T._holidays[date(2027, 12, 24)] == "Christmas Eve, pm (1/2 day)"
+    assert T._holidays[date(2027, 12, 31)] == "New Year’s Eve"
+    assert date(2027, 5, 6) in T._holidays and len(T._holidays) == 6
+    assert T.holiday_lines_ignored == ["Someday\tnot a date"]
+    # without a year line above, a date without year is not guessed
+    (T.share / "config" / "holidays.txt").write_text("Monday, 8 February\tRosenmontag\n", encoding="utf-8")
+    T.reload_holidays()
+    assert T._holidays == {} and len(T.holiday_lines_ignored) == 1
