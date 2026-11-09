@@ -227,3 +227,31 @@ def test_version_file_with_bom(T, tool, monkeypatch, tmp_path):
     real = importlib.import_module("Exostaff_Activity_Report_Tool").__dict__["check_version"]
     latest, update = real()
     assert latest == "99.0.0" and update
+
+
+def test_description_suggestions(tool):
+    from conftest import entry
+    T = tool
+    data = [entry("2026-10-01", "GSTRACE update"), entry("2026-10-02", "GSTRACE update."),
+            entry("2026-10-03", "gstrace  update", user="Bob B"), entry("2026-10-05", "Slides for the CDR"),
+            entry("2026-10-06", "Review of RFCT documents"),
+            entry("2026-10-07", "Other task", task=2), entry("2026-10-08", "Same task, other WP", wp="SLM"),
+            entry("2026-10-09", "Holiday", etype="Holiday")]
+    # one suggestion per activity (case, spaces, final full stop), its most used spelling, most used first
+    assert T.description_suggestions(data, 1, "WP6") == [
+        "GSTRACE update", "Review of RFCT documents", "Slides for the CDR"]
+    # filtered on every word typed, anywhere in the text, any case
+    assert T.description_suggestions(data, 1, "WP6", "cdr SLI") == ["Slides for the CDR"]
+    assert T.description_suggestions(data, 1, "WP6", "gstrace update") == []   # already typed in full
+    assert T.description_suggestions(data, 1, "SLM") == ["Same task, other WP"]
+    assert T.description_suggestions(data, 3, "WP7") == []
+    assert len(T.description_suggestions(
+        [entry("2026-10-01", f"activity {k}") for k in range(20)], 1, "WP6")) == 8
+
+
+def test_recent_archived_entries(tool):
+    from conftest import entry
+    T = tool
+    T.write_week_archive(2026, 43, [entry("2026-10-19", "recent")])
+    T.write_week_archive(2025, 10, [entry("2025-03-03", "too old")])
+    assert [a["description"] for a in T.recent_archived_entries()] == ["recent"]
