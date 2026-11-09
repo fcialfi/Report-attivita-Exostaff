@@ -2088,15 +2088,6 @@ def load_report_params() -> dict[str, str]:
     return params
 
 
-def effective_report_params(template_path) -> list[tuple[str, str, bool]]:
-    """(name, value, set in report_params.txt) of each parameter as the monthly
-    report will have it: the saved value, otherwise the template's."""
-    saved = load_report_params()
-    in_template = template_report_params(template_path) if template_path else {}
-    return [(name, saved.get(name) or in_template.get(name, ""), bool(saved.get(name)))
-            for name, _, _ in REPORT_PARAMS]
-
-
 def save_report_params(params: dict[str, str]) -> None:
     if read_only:
         raise PermissionError(READ_ONLY_MSG)
@@ -3345,45 +3336,6 @@ class ReportParamsDialog(_FittedToplevel):
             return
         self.destroy()
 
-class ConfirmReportParams(_FittedToplevel):
-    """Before the monthly report: the cover-page values it will have, with
-    Generate / Change… / Cancel. ``result`` is "generate", "change" or None."""
-
-    def __init__(self, parent, template_path, month_label: str):
-        super().__init__(parent)
-        self.title("Monthly report")
-        self.resizable(False, False)
-        self.configure(bg=BG_PANEL)
-        self.result = None
-        ttk.Label(self, text=f"Monthly report for {month_label}",
-                  font=("Segoe UI", 10, "bold")).pack(padx=16, pady=(14, 2))
-        ttk.Label(self, text="Cover page values (Edit → Report parameters…):",
-                  foreground=FG_DIM).pack(padx=16)
-        grid = ttk.Frame(self)
-        grid.pack(padx=16, pady=10, fill="x")
-        for row, (name, value, own) in enumerate(effective_report_params(template_path)):
-            ttk.Label(grid, text=name).grid(row=row, column=0, sticky="w", padx=(0, 12))
-            ttk.Label(grid, text=value or "(empty)", font=("Segoe UI", 9, "bold")).grid(
-                row=row, column=1, sticky="w")
-            ttk.Label(grid, text="" if own else "from the template", foreground=FG_DIM,
-                      font=("Segoe UI", 8)).grid(row=row, column=2, sticky="w", padx=(10, 0))
-        btns = ttk.Frame(self)
-        btns.pack(pady=(4, 14))
-        ttk.Button(btns, text="📄  Generate…", style="Accent.TButton", width=14,
-                   command=lambda: self._close("generate")).grid(row=0, column=0, padx=6)
-        ttk.Button(btns, text="⚙  Change…", width=12,
-                   command=lambda: self._close("change")).grid(row=0, column=1, padx=6)
-        ttk.Button(btns, text="Cancel", width=10, command=self.destroy).grid(row=0, column=2, padx=6)
-        self.bind("<Return>", lambda e: self._close("generate"))
-        self.bind("<Escape>", lambda e: self.destroy())
-        self.update_idletasks()
-        self._fit_window(max(460, self.winfo_reqwidth()), self.winfo_reqheight())
-        self.grab_set()
-
-    def _close(self, result: str) -> None:
-        self.result = result
-        self.destroy()
-
 # ---------------------------------------------------------------------------
 # Monthly statistics window
 # ---------------------------------------------------------------------------
@@ -4054,6 +4006,16 @@ class App:
         style.map("TButton",
                   background=[("active", BG_ENTRY), ("pressed", BORDER)],
                   relief=[("pressed", "flat")])
+
+        # Bottom bar, by function: green = makes a document, lilac = to look at
+        tints = ({"Doc": ("#1f3d2b", "#2a5239", "#cfe9d6"), "Look": ("#2f2a45", "#3d3659", "#ddd5f5")}
+                 if DARK else
+                 {"Doc": ("#dff3e4", "#c8eacf", "#1d5e33"), "Look": ("#ece6fb", "#ddd3f7", "#4a3a86")})
+        for name, (bg, active, fg) in tints.items():
+            style.configure(f"{name}.TButton", font=FONT_UI, padding=(8, 4),
+                            background=bg, foreground=fg, relief="flat", borderwidth=1)
+            style.map(f"{name}.TButton", background=[("active", active), ("pressed", active)],
+                      relief=[("pressed", "flat")])
 
         # Danger button
         style.configure("Danger.TButton",
@@ -4943,8 +4905,8 @@ class App:
             bottom.columnconfigure(col, uniform="actions")
         bold = ("Segoe UI", 9, "bold")
 
-        def _action(row, col, text, command, tip):
-            btn = ttk.Button(bottom, text=text, command=command)
+        def _action(row, col, text, command, tip, style="TButton"):
+            btn = ttk.Button(bottom, text=text, command=command, style=style)
             btn.grid(row=row, column=col, sticky="we", padx=(0, 4), pady=(0 if row == 0 else 4, 0))
             add_tooltip(btn, tip)
             return btn
@@ -4980,10 +4942,12 @@ class App:
         _action(0, 3, "⟳  Current week", self.load_current_week, "Return to the current week's entries.")
         self._btn_save_cw = _action(0, 4, "💾  Save week", self.save_current_week_button,
                                     "Save the current table back to the weekly archive.")
+        # green: makes a document; lilac: to look at (Doc / Look styles)
         _action(0, 5, "📅  Next-week plan", self.open_next_week_editor,
-                "Plan next week's activities: they go into the weekly summary.")
+                "Plan next week's activities: they go into the weekly summary.", "Doc.TButton")
         _action(0, 6, "📋  Weekly summary", self.weekly,
-                "Generate the weekly summary text of the selected CW. Uses the next-week plan if saved.")
+                "Generate the weekly summary text of the selected CW. Uses the next-week plan if saved.",
+                "Doc.TButton")
 
         # ── Row 1: the month ────────────────────────────────────────────────
         ttk.Label(bottom, text="Month", font=bold).grid(row=1, column=0, sticky="w", padx=(0, 10), pady=(4, 0))
@@ -5018,12 +4982,14 @@ class App:
         self._month_label_var.set(month_label_of(self.month_var.get()))
 
         _action(1, 2, "📄  Monthly Word", self.monthly,
-                "Aggregate all weekly archives for the selected month and fill the Word template.")
+                "Aggregate all weekly archives for the selected month and fill the Word template.",
+                "Doc.TButton")
         _action(1, 3, "📂  Open report…", self.open_monthly_report,
-                "Open a previously generated monthly Word report.")
-        _action(1, 4, "📊  Statistics", self.show_stats, "Show monthly statistics by user, task and project.")
+                "Open a previously generated monthly Word report.", "Look.TButton")
+        _action(1, 4, "📊  Statistics", self.show_stats, "Show monthly statistics by user, task and project.",
+                "Look.TButton")
         _action(1, 5, "📈  Task trend", self.show_trend,
-                "Effort per task over several months, with a chart.")
+                "Effort per task over several months, with a chart.", "Look.TButton")
 
         ttk.Separator(bottom, orient="vertical").grid(row=0, column=7, rowspan=2, sticky="ns", padx=(8, 8))
         btn_exit = ttk.Button(bottom, text="✖  Exit", command=self.on_close, style="Danger.TButton")
@@ -6276,8 +6242,6 @@ class App:
             date(y, m, 1)   # month 1..12
         except Exception:
             messagebox.showerror("Input error", "Month must be YYYY-MM (e.g. 2026-09)."); return
-        if not self._confirm_report_params(date(y, m, 1).strftime("%B %Y")):
-            return
         default = f"monthly_activity_report_{y}_{m:02d}.docx"
         # Default save dir: OneDrive monthly_reports or io_dir/monthly_reports
         _candidates_s = [
@@ -6693,8 +6657,7 @@ You can preview totals first via "📊 Statistics".
 Cover-page values (contract, purchase order, WP, Service Level
 Manager, EUM Technical Officer) are set with Edit → Report
 parameters…. They are saved for everybody in config/report_params.txt;
-an empty field keeps the template's text. "📄 Monthly Word" shows them
-first: Generate… to go on, Change… to correct them.
+an empty field keeps the template's text.
 
 Effort over several months: "📈 Task trend" (row Month), View →
 Task trend…, or the button at the bottom of the Statistics window. It shows a task × month
@@ -6907,17 +6870,6 @@ will show the new version number on next launch.
                 "Dropdowns updated.")
         except Exception as e:
             messagebox.showerror("Config error", str(e))
-
-    def _confirm_report_params(self, month_label: str) -> bool:
-        """Show the cover-page values before the monthly report; Change… edits
-        them and shows them again. False: cancelled."""
-        while True:
-            dlg = ConfirmReportParams(self.root, self.template_path, month_label)
-            self.root.wait_window(dlg)
-            if dlg.result != "change":
-                return dlg.result == "generate"
-            editor = ReportParamsDialog(self.root, self.template_path, can_write=self._lock_still_ours)
-            self.root.wait_window(editor)
 
     def open_report_params(self) -> None:
         if not require_io_dir():
