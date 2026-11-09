@@ -3,6 +3,7 @@ __pycache__/
 *.spec
 build_log.txt
 _cfg_tmp.txt
+build_info.json
 
 # Per-user runtime state (lives next to the exe)
 app_state.json

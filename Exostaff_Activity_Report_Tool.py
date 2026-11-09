@@ -84,10 +84,24 @@ def setup_log_file() -> None:
 # Configuration / constants
 # ---------------------------------------------------------------------------
 APP_TITLE         = "Activity Report Tool"
-APP_VERSION       = "1.2.6"   # updated by build.bat on each release
-# Release folder (VERSION.txt, EXE_LOCATION.txt, exe) — written by build.bat.
+
+
+def _build_info() -> dict:
+    """build_info.json, written by build.bat (update_version.py) and bundled into
+    the exe: version and release folder of the build. Not in git, so a build
+    never modifies this file. Running from source without it: the defaults."""
+    base = Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parent))
+    try:
+        return json.loads((base / "build_info.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+
+
+_BUILD = _build_info()
+APP_VERSION       = _BUILD.get("version", "1.2.6")
+# Release folder (VERSION.txt, EXE_LOCATION.txt, exe), set by build.bat.
 # "~" = the user's home, so a OneDrive folder resolves on every PC.
-RELEASE_DIR       = "~/OneDrive - eumetsat.int/Exostaff Report Generator"
+RELEASE_DIR       = _BUILD.get("release_dir", "~/OneDrive - eumetsat.int/Exostaff Report Generator")
 UPDATE_CHECK_MS   = 4 * 60 * 60 * 1000   # re-check for a new release while open
 SAVE_BACKUP_EVERY = 10
 
@@ -407,6 +421,23 @@ HOLIDAYS_TEMPLATE = """# EUMETSAT Public Holidays
 2026-12-24 | Christmas Eve
 2026-12-25 | Christmas Day
 2026-12-31 | New Year\'s Eve
+
+# 2027
+2027-01-01 | New Year\'s Day
+2027-02-08 | Rosenmontag
+2027-03-26 | Good Friday
+2027-03-29 | Easter Monday
+2027-05-06 | Ascension Day
+2027-05-07 | Ascension Day Extension
+2027-05-17 | Whit Monday
+2027-05-27 | Corpus Christi
+2027-05-28 | Corpus Christi Extension
+2027-09-06 | Unification Day Bulgaria
+2027-10-29 | Republic Day Türkiye
+2027-12-24 | Christmas Eve (pm, 1/2 day)
+2027-12-27 | Christmas Day Extension
+2027-12-28 | Christmas 2nd Day Extension
+2027-12-31 | New Year\'s Eve
 """
 
 
