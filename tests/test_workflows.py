@@ -165,3 +165,24 @@ def test_report_parameters_dialog_saves(session, tool):
     dlg._vars["EUM Technical Officer"].set("  Mario Rossi ")
     dlg._save()
     assert tool.load_report_params() == {"EUM Technical Officer": "Mario Rossi"}
+
+
+def test_description_suggestions_in_the_form(session, tool):
+    mon = date(2026, 10, 19)
+    s = session(mon)
+    s.add(mon, "GSTRACE update"); s.add(mon, "Slides for the CDR"); s.add(mon, "Other task", task=2)
+    s.save_week(); s.close()
+    s = session(mon + timedelta(days=1))
+    a = s.app
+    a.wp_var.set("WP6"); a._on_wp_changed(); a.task_var.set("1 - T1")
+    a.root.update()
+    a.desc.focus_force(); a.desc.insert("1.0", "gst")
+    a._show_suggestions(); a.root.update()
+    assert a._suggest_list.get(0, "end") == ("GSTRACE update",)
+    assert a._move_suggestion(1) == "break" and a._accept_suggestion_key() == "break"
+    assert a.desc.get("1.0", "end").strip() == "GSTRACE update" and not a._suggestions_shown()
+    a.desc.delete("1.0", "end"); a._show_suggestions()
+    assert set(a._suggest_list.get(0, "end")) == {"GSTRACE update", "Slides for the CDR"}   # task 1 only
+    assert a._accept_suggestion_key() is None   # Enter with nothing chosen: a new line, as before
+    a.task_var.set("2 - T2")
+    assert not a._suggestions_shown()            # another task: the list closes

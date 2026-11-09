@@ -2151,6 +2151,66 @@ def project_for_task(task_no, wp: str = "") -> str:
         return "Common"
     return _project_map.get((n, wp), _project_map.get((n, ""), "Common"))
 
+# ---------------------------------------------------------------------------
+# Description suggestions: the descriptions already used for a task, so that
+# the same activity keeps the same words (one bullet in the monthly report)
+# ---------------------------------------------------------------------------
+
+SUGGESTION_WEEKS = 26   # archives read for the suggestions: about six months
+
+
+def recent_archived_entries(weeks: int = SUGGESTION_WEEKS) -> list:
+    """Entries of the weekly archives of the last ``weeks`` weeks (unreadable files skipped)."""
+    first = date.today() - timedelta(weeks=weeks)
+    out = []
+    for path in weekly_archive_files():
+        try:
+            y, cw = (int(x) for x in re.findall(r"\d+", path.stem))
+            if iso_week_monday(y, cw) + timedelta(days=6) < first:
+                continue
+            out += normalise_data(json.loads(path.read_text(encoding="utf-8")))
+        except Exception as exc:
+            log.warning("suggestions: skipping %s: %s", path.name, exc)
+    return out
+
+
+def _description_key(text: str) -> str:
+    """Descriptions that differ only in case, spaces or a final full stop are one suggestion."""
+    return " ".join(str(text).split()).rstrip(".;").casefold()
+
+
+def description_suggestions(entries, task_no, wp: str, typed: str = "", limit: int = 8) -> list[str]:
+    """Descriptions already used for this task (any user), most used and most recent first.
+
+    ``typed``: only those containing every word typed (anywhere, any case); the text already typed
+    in full is not suggested again. Each description is given in its most used spelling."""
+    try:
+        task_no = int(task_no)
+    except (TypeError, ValueError):
+        return []
+    wp = normalise_wp(wp or "")
+    groups: dict[str, dict] = {}
+    for a in entries:
+        if a.get("entry_type", "Activity") != "Activity" or int(a.get("task_no", 0) or 0) != task_no:
+            continue
+        if normalise_wp(entry_wp(a)) != wp:
+            continue
+        text = " ".join(str(a.get("description", "")).split())
+        key = _description_key(text)
+        if not key:
+            continue
+        g = groups.setdefault(key, {"count": 0, "last": "", "spellings": Counter()})
+        g["count"] += 1
+        g["last"] = max(g["last"], str(a.get("date", "")))
+        g["spellings"][text] += 1
+    words = _description_key(typed).split()
+    typed_key = _description_key(typed)
+    found = [(g["count"], g["last"], g["spellings"].most_common(1)[0][0]) for key, g in groups.items()
+             if key != typed_key and all(w in key for w in words)]
+    found.sort(key=lambda x: (x[0], x[1]), reverse=True)
+    return [text for _, _, text in found[:limit]]
+
+
 def _clean_bullet(text: str) -> str:
     text = " ".join(str(text or "").split())
     return text.rstrip(".;") + "." if text else ""
@@ -4326,6 +4386,105 @@ class App:
             except Exception: pass
         return max(dates) if dates else date.today()
 
+    # -----------------------------------------------------------------------
+    # Description suggestions
+    # -----------------------------------------------------------------------
+
+    def _current_suggestions(self) -> list[str]:
+        if self.entry_type_var.get() != "Activity" or not get_io_root():
+            return []
+        try:
+            task_no, _title, wp = self.parse_task()
+        except ValueError:
+            return []
+        if self._suggest_pool is None:
+            try:
+                self._suggest_pool = recent_archived_entries()
+            except Exception as exc:
+                log.warning("suggestions: %s", exc)
+                self._suggest_pool = []
+        return description_suggestions(self._suggest_pool + normalise_data(self.data), task_no, wp,
+                                       self.desc.get("1.0", "end"))
+
+    def _suggestions_shown(self) -> bool:
+        return getattr(self, "_suggest_visible", False)
+
+    def _show_suggestions(self) -> None:
+        items = self._current_suggestions()
+        if not items:
+            self._hide_suggestions()
+            return
+        if self._suggest_popup is None:
+            pop = tk.Toplevel(self.root)
+            pop.overrideredirect(True)
+            lb = tk.Listbox(pop, activestyle="none", font=("Segoe UI", 9), bg=BG_ENTRY, fg=FG_MAIN,
+                            selectbackground=ACCENT, selectforeground="#ffffff", relief="solid",
+                            borderwidth=1, highlightthickness=0, exportselection=False)
+            lb.pack(fill="both", expand=True)
+            lb.bind("<ButtonRelease-1>", lambda e: self._accept_suggestion())
+            self._suggest_popup, self._suggest_list = pop, lb
+        pop, lb = self._suggest_popup, self._suggest_list
+        if tuple(items) != lb.get(0, "end"):   # same list: the suggestion chosen stays chosen
+            lb.delete(0, "end")
+            for text in items:
+                lb.insert("end", text)
+            lb.configure(height=len(items))
+        pop.update_idletasks()
+        x = self.desc.winfo_rootx()
+        y = self.desc.winfo_rooty() + self.desc.winfo_height()
+        pop.geometry(f"{self.desc.winfo_width()}x{lb.winfo_reqheight()}+{x}+{y}")
+        pop.deiconify()
+        pop.lift()
+        self._suggest_visible = True
+
+    def _hide_suggestions(self) -> None:
+        if self._suggest_popup is not None:
+            self._suggest_popup.withdraw()
+        self._suggest_visible = False
+
+    def _hide_suggestions_if_unfocused(self) -> None:
+        try:
+            focus = self.root.focus_get()
+        except (KeyError, tk.TclError):
+            focus = None
+        if focus is not self.desc:
+            self._hide_suggestions()
+
+    def _on_desc_key(self, event) -> None:
+        if event.keysym in ("Up", "Down", "Return", "KP_Enter", "Escape", "Tab") or event.keysym.endswith(
+                ("_L", "_R")):
+            return
+        self._show_suggestions()
+
+    def _move_suggestion(self, step: int):
+        if not self._suggestions_shown():
+            return None   # normal cursor movement in the text
+        lb = self._suggest_list
+        cur = lb.curselection()
+        k = (cur[0] + step) if cur else (0 if step > 0 else lb.size() - 1)
+        lb.selection_clear(0, "end")
+        if 0 <= k < lb.size():
+            lb.selection_set(k)
+            lb.see(k)
+        return "break"
+
+    def _accept_suggestion_key(self, event=None):
+        if self._suggestions_shown() and self._suggest_list.curselection():
+            self._accept_suggestion()
+            return "break"
+        return None   # Enter without a suggestion chosen: a new line, as before
+
+    def _accept_suggestion(self) -> None:
+        sel = self._suggest_list.curselection()
+        if not sel:
+            return
+        text = self._suggest_list.get(sel[0])
+        self.desc.delete("1.0", "end")
+        self.desc.insert("1.0", text)
+        self.desc.mark_set("insert", "end-1c")
+        self._hide_suggestions()
+        self.desc.focus_set()
+
     def _status(self, msg: str) -> None:
         self._status_var.set(msg)
         self.root.after(6000, lambda: self._status_var.set(""))
@@ -4514,6 +4673,22 @@ class App:
         self.desc = tk.Text(desc_row, height=4, font=("Segoe UI", 9), wrap="word", undo=True,
                             bg=BG_ENTRY, fg=FG_MAIN)
         self.desc.grid(row=0, column=1, sticky="we")
+        # Suggestions under the field: the descriptions already used for the task
+        # (description_suggestions); arrows + Enter or a click take one, Esc closes
+        self._suggest_pool = None    # archived entries of the last months, read once
+        self._suggest_popup = None
+        self.desc.bind("<KeyRelease>", self._on_desc_key, add="+")
+        self.desc.bind("<FocusIn>", lambda e: self._show_suggestions(), add="+")
+        self.desc.bind("<FocusOut>", lambda e: self.root.after(150, self._hide_suggestions_if_unfocused), add="+")
+        self.desc.bind("<Down>", lambda e: self._move_suggestion(1))
+        self.desc.bind("<Up>", lambda e: self._move_suggestion(-1))
+        self.desc.bind("<Return>", self._accept_suggestion_key)
+        self.desc.bind("<Escape>", lambda e: self._hide_suggestions())
+        self.task_var.trace_add("write", lambda *_: self._hide_suggestions())
+        self.root.bind("<Configure>", lambda e: self._hide_suggestions() if e.widget is self.root else None, add="+")
+        add_tooltip(self.desc, "Suggestions: descriptions already used for this task. Arrows + Enter or a "
+                               "click to use one, Esc to close. Same words for the same activity = one line "
+                               "in the monthly report.")
 
         btn_row = ttk.Frame(top)
         btn_row.grid(row=4, column=0, columnspan=8, sticky="w", pady=(8, 0))
@@ -5516,6 +5691,7 @@ class App:
                 saved.append(f"CW{cw:02d}/{y} ({count} entries)")
 
             auto_backup(self.data, force=True)   # always backup on Save week
+            self._suggest_pool = None            # suggestions: read the archive again
             # Snapshots predate the archive write: undoing one would leave its
             # entries in the archive with nothing left to remove them
             self._undo_stack.clear()
@@ -5567,6 +5743,7 @@ class App:
 
         release_lock()   # lock of the previous folder (no-op if not ours)
         set_io_dir(d)
+        self._suggest_pool = None   # suggestions from the new folder's archives
         self.last_io_dir = str(get_io_root())
         self._io_dir_var.set(self.last_io_dir)
         setup_log_file()
@@ -6260,7 +6437,14 @@ Fill in the form at the top of the window:
   • Effort (PD) — person-days worked (e.g. 0.5 or 1.0)
                   Warning shown if daily total exceeds 1.0 PD.
   • Task        — select from the list in config/tasks.txt
-  • Description — brief description of what was done
+  • Description — brief description of what was done.
+                  A list under the field suggests the descriptions
+                  already used for the chosen task (by anyone, last
+                  6 months), most used first; typing filters it.
+                  ↓/↑ + Enter or a click to use one, Esc to close.
+                  Reuse the same words for the same activity: the
+                  monthly report then shows it once, not as several
+                  similar lines.
 
 Click "💾 Save entry" (Ctrl+S) to add the entry to the table.
 
