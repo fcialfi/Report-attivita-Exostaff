@@ -282,3 +282,31 @@ def test_unsaved_entries_shown_in_orange(session, tool):
     s.save_week()
     assert orange() == []
     assert tool.unsaved_entries(a.data) == set()
+
+
+TEAM_TASKS = ("1 | T1 | P | WP6 | AlA\n"
+              "16 | Participation in any necessary meeting | P | WP6 | AlA\n"
+              "1 | U1 | P | WP7 | BoB\n"
+              "2 | U2 | P | WP7 | BoB\n"
+              "1 | S1 | P | SLM | AlA BoB\n")
+
+
+def test_user_sets_their_wp_and_meeting_task(session, tool, monkeypatch, tmp_path):
+    (tool.share / "config" / "tasks.txt").write_text(TEAM_TASKS, encoding="utf-8")
+    tool.reload_config()
+    assert tool.user_wps("Bob B") == ["WP7", "SLM"] and tool.user_main_wp("Alice A") == "WP6"
+    s = session(date(2026, 11, 10))
+    a = s.app
+    a.users, a.tasks = tool.reload_config()
+    a.user_var.set("Bob B"); a._apply_user_wp()
+    assert a.wp_var.get() == "WP7" and a.task_var.get().startswith("1 - U1")
+    a.user_var.set("Alice A"); a._apply_user_wp()
+    assert a.wp_var.get() == "WP6"
+    # editing an entry: the WP is not changed under it
+    s.add(date(2026, 11, 10), "x"); s._select("x"); a.load_selected_for_edit()
+    a.user_var.set("Bob B"); a._apply_user_wp()
+    assert a.wp_var.get() == "WP6"
+    # meetings: the meeting task of the WP, else task 1 of the WP, else the last one used
+    assert tool.meeting_task(a.tasks, "Alice A")[:3:2] == (16, "WP6")
+    assert tool.meeting_task(a.tasks, "Bob B")[:3:2] == (1, "WP7")
+    assert tool.meeting_task(a.tasks, "Bob B", {"Bob B": [2, "WP7"]})[:3:2] == (2, "WP7")

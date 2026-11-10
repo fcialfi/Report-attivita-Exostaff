@@ -2301,6 +2301,21 @@ def apply_report_params_to_doc(doc, params: dict[str, str]) -> None:
 # Report generation helpers
 # ---------------------------------------------------------------------------
 
+def user_wps(name: str) -> list[str]:
+    """WPs of a user, from the initials column of tasks.txt: the WP with most
+    of their tasks first, SLM last (Marco BRUNO -> MaB -> WP7)."""
+    initials = initials_for_user(name).casefold() if name else ""   # "Mab" here, "MaB" in tasks.txt
+    count = Counter(wp for (_, wp), people in _initials_map.items()
+                    if wp and initials in (p.casefold() for p in people))
+    return sorted(count, key=lambda w: (w.upper().startswith("SLM"), -count[w], w))
+
+
+def user_main_wp(name: str) -> str:
+    """The WP a user works on (not SLM), or "" if tasks.txt does not say."""
+    wps = [w for w in user_wps(name) if not w.upper().startswith("SLM")]
+    return wps[0] if wps else ""
+
+
 def initials_for_user(name: str) -> str:
     """Return initials for a user — from config if available, else auto-generated."""
     if name in _users_initials:
@@ -3059,8 +3074,19 @@ def read_outlook_meetings(start: datetime, end: datetime) -> list[dict]:
     return out
 
 
-def meeting_task(tasks) -> tuple | None:
-    """The task for meetings: the first whose title speaks of meetings."""
+def meeting_task(tasks, user: str = "", saved: dict | None = None) -> tuple | None:
+    """The task proposed for a user's meetings: the last one they used (saved:
+    {user: [task_no, wp]}); else the meeting task of their WP; else task 1 (the
+    first) of their WP; without a WP for them, the first meeting task."""
+    last = (saved or {}).get(user)
+    if last:
+        found = next(((n, t, wp) for n, t, wp in tasks if [n, wp] == list(last)), None)
+        if found:
+            return found
+    wp = user_main_wp(user) if user else ""
+    if wp:
+        mine = sorted((t for t in tasks if t[2] == wp), key=lambda t: t[0])
+        return next((t for t in mine if "meeting" in t[1].casefold()), mine[0] if mine else None)
     return next(((n, t, wp) for n, t, wp in tasks if "meeting" in t.casefold()), None)
 
 
@@ -3603,7 +3629,7 @@ class MeetingImportDialog(_FittedToplevel):
         opts.pack(fill="x", pady=(8, 0))
         opts.columnconfigure(1, weight=1)
         ttk.Label(opts, text="Task").grid(row=0, column=0, sticky="w", padx=(0, 6))
-        default = meeting_task(tasks)
+        default = meeting_task(tasks, user, self._settings.get("task_by_user", {}))
         self._task_var = tk.StringVar(value=next((k for k, v in self._task_labels.items() if v == default), ""))
         task_cb = ttk.Combobox(opts, textvariable=self._task_var, values=list(self._task_labels),
                                state="readonly")
@@ -3745,8 +3771,10 @@ class MeetingImportDialog(_FittedToplevel):
         task = self._task()
         if not chosen or not task:
             return
+        by_user = dict(self._settings.get("task_by_user", {}))
+        by_user[self._user] = [task[0], task[2]]   # proposed again next time for this user
         save_meeting_settings({"source": self._source.get(), "csv": self._csv_var.get().strip(),
-                               "exclude": self._exclude_var.get()})
+                               "exclude": self._exclude_var.get(), "task_by_user": by_user})
         self._on_add(meeting_entries(chosen, self._user, task))
         self.destroy()
 
@@ -5208,6 +5236,8 @@ class App:
                                            width=26, state="readonly"), 0, 3)
         if self.users:
             self.user_var.set(self.last_user if self.last_user in self.users else self.users[0])
+        # choosing a user sets their WP (from tasks.txt), so tasks of another WP are not picked by mistake
+        self.user_cb.bind("<<ComboboxSelected>>", lambda e: self._apply_user_wp())
 
         _label("Type", 0, 4)
         self.entry_type_var = tk.StringVar(value="Activity")
@@ -5660,6 +5690,14 @@ class App:
             wps.append(NO_WP)
         return wps
 
+    def _apply_user_wp(self) -> None:
+        """WP of the user just chosen (not while an entry is being edited)."""
+        wp = user_main_wp(self.user_var.get())
+        if self.edit_index is None and wp and wp in self.wp_cb["values"] and wp != self.wp_var.get():
+            self.wp_var.set(wp)
+            self._on_wp_changed()
+            self._status(f"WP set to {wp}, the WP of {self.user_var.get()} in tasks.txt.")
+
     def _populate_wp_cb(self, keep: bool = False) -> None:
         """Populate WP combobox and set default. keep=True (config reload):
         keep the current WP/task if they still exist, so an entry being
@@ -5682,7 +5720,8 @@ class App:
             return
         if wps:
             # Default: first non-SLM WP, or first WP
-            default = next((w for w in wps if w.upper() != "SLM"), wps[0])
+            mine = user_main_wp(self.user_var.get()) if hasattr(self, "user_var") else ""
+            default = mine if mine in wps else next((w for w in wps if w.upper() != "SLM"), wps[0])
             self.wp_var.set(default)
         else:
             # tasks.txt without WP column — show every task
@@ -7074,7 +7113,10 @@ Fill in the form at the top of the window:
   • Type        — Activity / Holiday / Sick Leave
   • Effort (PD) — person-days worked (e.g. 0.5 or 1.0)
                   Warning shown if daily total exceeds 1.0 PD.
-  • Task        — select from the list in config/tasks.txt
+  • Task        — select from the list in config/tasks.txt.
+                  Choosing the User sets the WP: the WP of that
+                  person's tasks in tasks.txt (initials column), e.g.
+                  MaB → WP7. Another WP (e.g. SLM) can still be chosen.
   • Description — brief description of what was done.
                   Typing, a list under the field suggests the
                   descriptions already used for the chosen task (by
