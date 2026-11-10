@@ -2877,7 +2877,7 @@ def export_to_xlsx(data: list, out_path: str) -> None:
 # ---------------------------------------------------------------------------
 
 # ---------------------------------------------------------------------------
-# Meetings from the Outlook calendar: one entry per meeting, effort = hours / 8
+# Meetings from the Outlook calendar: one entry per meeting, effort = hours / 8 rounded up to 0.1 PD
 # ---------------------------------------------------------------------------
 
 HOURS_PER_PD = 8
@@ -2917,8 +2917,9 @@ def meeting_hours(m: dict) -> float:
 
 
 def meeting_effort(m: dict) -> float:
-    """Person-days of a meeting: its duration / 8 h."""
-    return round(meeting_hours(m) / HOURS_PER_PD, 4)
+    """Person-days of a meeting: its duration / 8 h, rounded up to 0.1 PD
+    (30 min -> 0.1, 1 h -> 0.2, 4 h -> 0.5)."""
+    return math.ceil(round(meeting_hours(m) / HOURS_PER_PD * 10, 6)) / 10
 
 
 def meeting_preselected(m: dict, exclude_words) -> bool:
@@ -3042,7 +3043,7 @@ def meeting_task(tasks) -> tuple | None:
 
 
 def meeting_entries(meetings, user: str, task: tuple) -> list[dict]:
-    """Table entries for the meetings: one each, effort = hours / 8."""
+    """Table entries for the meetings: one each, effort = hours / 8 rounded up to 0.1."""
     n, title, wp = task
     return [normalise_activity({"date": m["start"].date().isoformat(), "user": user, "entry_type": "Activity",
                                 "task_no": n, "task_title": title, "task_wp": wp,
@@ -3534,7 +3535,7 @@ class NextWeekEditor(_FittedToplevel):
 class MeetingImportDialog(_FittedToplevel):
     """File → Import meetings from Outlook…: the meetings of a week, from the
     classic Outlook of this PC or from a calendar exported as CSV. Ticked rows
-    become entries of the meeting task, effort = hours / 8."""
+    become entries of the meeting task, effort = hours / 8 rounded up to 0.1 PD."""
 
     def __init__(self, parent, week: tuple[int, int], tasks: list[tuple], user: str,
                  existing, on_add):
@@ -3701,7 +3702,7 @@ class MeetingImportDialog(_FittedToplevel):
         pd = sum(meeting_effort(m) for m, on in zip(self._meetings, self._checked) if on)
         source = "Outlook" if self._source.get() == "outlook" else "CSV"
         self._info_var.set(f"{len(self._meetings)} meetings in {source}  ·  {n} ticked  ·  "
-                           f"{format_effort(pd)} PD ({pd * HOURS_PER_PD:g} h)")
+                           f"{format_effort(pd)} PD (hours / 8, each rounded up to 0.1 PD)")
         self._btn_add.state(["!disabled"] if n and self._task() else ["disabled"])
 
     def _toggle(self, event=None):
