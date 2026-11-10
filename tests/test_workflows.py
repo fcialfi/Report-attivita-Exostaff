@@ -265,3 +265,20 @@ def test_import_meetings_from_csv(session, tool, monkeypatch, tmp_path):
     assert dlg._checked == [False, False, False, False]
     assert tool.load_meeting_settings()["csv"] == str(path)
     dlg.destroy()
+
+
+def test_unsaved_entries_shown_in_orange(session, tool):
+    mon = date(2026, 10, 19)
+    s = session(mon)
+    a = s.app
+    orange = lambda: sorted(a.data[a._display_index_map[i]]["description"]
+                            for i in a.tree.get_children() if "unsaved" in a.tree.item(i, "tags"))
+    s.add(mon, "A"); s.add(mon, "B")
+    assert orange() == ["A", "B"]
+    s.save_week()
+    assert orange() == []
+    s.edit("A", new_desc="A2"); s.add(mon, "C")
+    assert orange() == ["A2", "C"]                     # edited and new, not yet archived
+    s.save_week()
+    assert orange() == []
+    assert tool.unsaved_entries(a.data) == set()

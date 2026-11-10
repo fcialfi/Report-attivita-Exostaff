@@ -1460,6 +1460,28 @@ def pending_archive_changes(data: list, loaded_keys) -> int:
     return changes
 
 
+def unsaved_entries(data: list) -> set[int]:
+    """Indices of the table entries not (yet) in their weekly archive: new,
+    imported or edited since the last Save week. One archived copy covers one
+    table entry (two identical 0.5 PD entries need two copies)."""
+    groups: dict[tuple, list[int]] = {}
+    for i, a in enumerate(data):
+        try:
+            groups.setdefault(iso_year_week_for_date(safe_date(a["date"])), []).append(i)
+        except (ValueError, KeyError):
+            pass
+    out: set[int] = set()
+    for (y, cw), indices in groups.items():
+        archived = Counter(map(loaded_key, load_week_entries(y, cw)))
+        for i in indices:
+            k = loaded_key(data[i])
+            if archived[k] > 0:
+                archived[k] -= 1
+            else:
+                out.add(i)
+    return out
+
+
 def archive_is_up_to_date(data: list, loaded_keys: set) -> bool:
     """True if "Save week" would not change any weekly archive file."""
     groups: dict[tuple, list] = {}
@@ -4920,6 +4942,11 @@ class App:
 
     def _update_archive_notice(self) -> None:
         """"● N changes not in the week archive yet — Save week below" next to Save entry."""
+        try:
+            self._unsaved_idx = unsaved_entries(self.data) if self._table_dirty else set()
+        except Exception as exc:
+            log.warning("unsaved_entries: %s", exc)
+            self._unsaved_idx = set()
         if not hasattr(self, "_archive_notice"):
             return
         try:
@@ -5299,6 +5326,7 @@ class App:
                                 foreground="#8b6000", font=("Segoe UI", 9, "italic"))
         self.tree.tag_configure("pending",    background="#dbeafe",
                                 foreground="#1e40af", font=("Segoe UI", 9, "bold"))
+        self.tree.tag_configure("unsaved",    foreground="#e07b00")   # not yet in the week archive
         self.tree.pack(side="left", fill="both", expand=True, padx=(0,0))
         self.tree.bind("<Double-1>", self.load_selected_for_edit)
 
@@ -5582,12 +5610,14 @@ class App:
                 except Exception:
                     date_display = f"⚠ {date_display}"
 
+            # orange text: not yet in the week archive (new, imported or edited)
+            unsaved = orig_idx in getattr(self, "_unsaved_idx", ())
             self.tree.insert("", "end", iid=iid,
                 values=(
                     date_display, a.get("user", ""), entry_type,
                     task_display, format_effort(a.get("effort", 0)), a.get("description", "")[:120],
                 ),
-                tags=(tag,),
+                tags=(tag, "unsaved") if unsaved else (tag,),
             )
 
     def selected_index(self) -> int | None:
