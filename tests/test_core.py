@@ -399,9 +399,11 @@ def test_meetings_from_an_outlook_csv(tool, tmp_path):
     assert [T.meeting_preselected(m, words) for m in week] == [True, False, True, False]   # excluded, tentative
     assert T.clean_meeting_subject("Upd1: EPS Sterna CCB") == "EPS Sterna CCB"
     assert T.clean_meeting_subject("RE: FW:  Review") == "Review"
-    assert [T.meeting_effort(m) for m in week] == [0.125, 0.5, 0.1875, 0.125]   # hours / 8
+    assert [T.meeting_effort(m) for m in week] == [0.2, 0.5, 0.2, 0.2]   # hours / 8, rounded up to 0.1
+    half = {"start": week[0]["start"], "end": week[0]["start"] + (week[0]["end"] - week[0]["start"]) / 2}
+    assert T.meeting_effort(half) == 0.1                                  # 30 min
     task = T.meeting_task([(1, "T1", "WP6"), (22, "Participation in any necessary meeting", "WP6")])
     entries = T.meeting_entries([week[0], week[2]], "Alice A", task)
     assert [(e["date"], e["task_no"], e["effort"], e["description"]) for e in entries] == [
-        ("2026-11-10", 22, 0.125, "EPS-Sterna Ground Segment Engineering Team Weekly Meeting"),
-        ("2026-11-12", 22, 0.1875, "EPS Sterna CCB")]
+        ("2026-11-10", 22, 0.2, "EPS-Sterna Ground Segment Engineering Team Weekly Meeting"),
+        ("2026-11-12", 22, 0.2, "EPS Sterna CCB")]

@@ -257,7 +257,7 @@ def test_import_meetings_from_csv(session, tool, monkeypatch, tmp_path):
     assert dlg._checked == [True, False, True, False]
     dlg._add()
     assert sorted((x["description"], x["effort"]) for x in a.data) == [
-        ("EPS Sterna CCB", 0.1875), ("EPS-Sterna Ground Segment Engineering Team Weekly Meeting", 0.125)]
+        ("EPS Sterna CCB", 0.2), ("EPS-Sterna Ground Segment Engineering Team Weekly Meeting", 0.2)]
     # importing again: the meetings already in the table are not ticked
     a.import_meetings()
     dlg = next(w for w in a.root.winfo_children() if isinstance(w, tool.MeetingImportDialog))
