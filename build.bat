@@ -91,12 +91,34 @@ if exist %APP_NAME%.spec del %APP_NAME%.spec
 :: ── Build ───────────────────────────────────────────────────────────────
 echo.
 echo  [INFO] Building exe...
-python -m PyInstaller --onefile --windowed --name "%APP_NAME%" --icon "assets\exostaff_icon.ico" --add-data "assets;assets" --add-data "build_info.json;." --distpath "%DIST_DIR%" --workpath "%BUILD_DIR%" --clean %SCRIPT% >> %LOG_FILE% 2>&1
-if errorlevel 1 (
-    echo [ERROR] Build FAILED. See %LOG_FILE%.
-    findstr /c:"_append_data_to_exe" %LOG_FILE% >nul && echo         The new exe could not be written: the antivirus was probably scanning it. Run build.bat again.
-    pause & exit /b 1
-)
+:: The antivirus often opens the new exe while PyInstaller is still writing it
+:: ("_append_data_to_exe failed"): wait and try again, up to 3 times.
+set ATTEMPT=0
+:build_exe
+set /a ATTEMPT+=1
+python -m PyInstaller --onefile --windowed --name "%APP_NAME%" --icon "assets\exostaff_icon.ico" --add-data "assets;assets" --add-data "build_info.json;." --distpath "%DIST_DIR%" --workpath "%BUILD_DIR%" --clean %SCRIPT% > "%BUILD_ROOT%\pyinstaller_last.log" 2>&1
+set BUILD_ERR=%errorlevel%
+type "%BUILD_ROOT%\pyinstaller_last.log" >> %LOG_FILE%
+if "%BUILD_ERR%"=="0" goto build_ok
+findstr /c:"_append_data_to_exe" "%BUILD_ROOT%\pyinstaller_last.log" >nul
+if errorlevel 1 goto build_failed
+if %ATTEMPT% geq 3 goto build_failed_av
+echo  [WARN] The antivirus is scanning the new exe ^(attempt %ATTEMPT% of 3^): trying again in 15 s...
+timeout /t 15 /nobreak >nul
+del /f /q "%DIST_DIR%\%APP_NAME%.exe" 2>nul
+goto build_exe
+
+:build_failed_av
+echo [ERROR] Build FAILED 3 times: the new exe stays locked, most likely by the antivirus.
+echo         Check Windows Security - Protection history for ActivityReportTool.exe, or ask IT
+echo         to exclude %BUILD_ROOT% from the scan. Details in %LOG_FILE%.
+pause & exit /b 1
+
+:build_failed
+echo [ERROR] Build FAILED. See %LOG_FILE%.
+pause & exit /b 1
+
+:build_ok
 echo  [OK] Build successful.
 
 :: ── Write VERSION.txt ───────────────────────────────────────────────────
