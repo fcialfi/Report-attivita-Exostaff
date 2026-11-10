@@ -3630,7 +3630,9 @@ class MeetingImportDialog(_FittedToplevel):
         rb.pack(side="left")
         if not outlook_available():
             rb.state(["disabled"])
-            add_tooltip(rb, f"Outlook link not available: {outlook_problem}")
+            # the reason in plain sight (a tooltip does not show on a disabled option)
+            ttk.Label(top, text=f"Outlook link not available: {outlook_problem}", foreground="#e07b00",
+                      wraplength=900, justify="left").pack(fill="x", pady=(4, 0))
         ttk.Radiobutton(src, text="CSV exported from Outlook:", value="csv", variable=self._source,
                         command=self._reload).pack(side="left", padx=(14, 4))
         self._csv_var = tk.StringVar(value=self._settings.get("csv", ""))
