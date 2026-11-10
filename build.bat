@@ -69,7 +69,7 @@ echo  [OK] Version: %NEW_VERSION%
 :: ── Dependencies ────────────────────────────────────────────────────────
 python -m PyInstaller --version >nul 2>&1
 if errorlevel 1 ( pip install pyinstaller )
-pip install python-docx lxml openpyxl --quiet >> %LOG_FILE% 2>&1
+pip install python-docx lxml openpyxl pywin32 --quiet >> %LOG_FILE% 2>&1
 echo  [OK] Dependencies ready.
 
 :: ── Clean ───────────────────────────────────────────────────────────────

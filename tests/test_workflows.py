@@ -238,3 +238,30 @@ def test_archive_notice_next_to_save_entry(session, tool):
     s.save_week()
     assert not notice() and tool.pending_archive_changes(s.app.data, s.app._loaded_week_keys) == 0
 
+
+
+def test_import_meetings_from_csv(session, tool, monkeypatch, tmp_path):
+    from test_core import OUTLOOK_CSV
+    path = tmp_path / "calendar.csv"
+    path.write_text(OUTLOOK_CSV, encoding="utf-8")
+    monkeypatch.setattr(tool, "outlook_available", lambda: False)
+    monkeypatch.setattr(tool, "APP_STATE_FILE", tmp_path / "app_state.json")
+    tool.save_meeting_settings({"source": "csv", "csv": str(path)})
+    s = session(date(2026, 11, 10))
+    a = s.app
+    a.tasks = a.tasks + [(22, "Participation in any necessary meeting", "WP6")]
+    a.week_year.set("2026"); a.cw_var.set("46")
+    a.import_meetings()
+    dlg = next(w for w in a.root.winfo_children() if isinstance(w, tool.MeetingImportDialog))
+    dlg._reload()
+    assert dlg._checked == [True, False, True, False]
+    dlg._add()
+    assert sorted((x["description"], x["effort"]) for x in a.data) == [
+        ("EPS Sterna CCB", 0.1875), ("EPS-Sterna Ground Segment Engineering Team Weekly Meeting", 0.125)]
+    # importing again: the meetings already in the table are not ticked
+    a.import_meetings()
+    dlg = next(w for w in a.root.winfo_children() if isinstance(w, tool.MeetingImportDialog))
+    dlg._reload()
+    assert dlg._checked == [False, False, False, False]
+    assert tool.load_meeting_settings()["csv"] == str(path)
+    dlg.destroy()
