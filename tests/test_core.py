@@ -373,3 +373,35 @@ def test_holidays_in_the_eumetsat_list_format(tool):
     (T.share / "config" / "holidays.txt").write_text("Monday, 8 February\tRosenmontag\n", encoding="utf-8")
     T.reload_holidays()
     assert T._holidays == {} and len(T.holiday_lines_ignored) == 1
+
+
+OUTLOOK_CSV = (
+    '﻿"Subject","Start Date","Start Time","End Date","End Time","All day event","Reminder on/off",'
+    '"Reminder Date","Reminder Time","Meeting Organizer","Required Attendees","Optional Attendees",'
+    '"Meeting Resources","Billing Information","Categories","Description","Location","Mileage","Priority",'
+    '"Private","Sensitivity","Show time as"\n'
+    '"Christmas Day","25/12/2026","00:00:00","26/12/2026","00:00:00","True","False",,,,,,,,"Holiday",,,,"Normal","False","Normal","3"\n'
+    '"EPS-Sterna Ground Segment Engineering Team Weekly Meeting","10/11/2026","10:00:00","10/11/2026","11:00:00","False",,,,,,,,,,,,,"Normal","False","Normal","2"\n'
+    '"Upd1: EPS Sterna CCB","12/11/2026","14:00:00","12/11/2026","15:30:00","False",,,,,,,,,,,,,"Normal","False","Normal","2"\n'
+    '"Maintenance of M-Files","11/11/2026","08:00:00","11/11/2026","12:00:00","False",,,,,,,,,,,,,"Normal","False","Normal","2"\n'
+    '"Optional talk","13/11/2026","12:00:00","13/11/2026","13:00:00","False",,,,,,,,,,,,,"Normal","False","Normal","1"\n'
+    '"Next week","17/11/2026","09:00:00","17/11/2026","10:00:00","False",,,,,,,,,,,,,"Normal","False","Normal","2"\n')
+
+
+def test_meetings_from_an_outlook_csv(tool, tmp_path):
+    from datetime import datetime
+    T = tool
+    path = tmp_path / "calendar.csv"
+    path.write_text(OUTLOOK_CSV, encoding="utf-8")
+    week = T.read_outlook_csv(path, datetime(2026, 11, 9), datetime(2026, 11, 16))
+    assert [m["subject"][:12] for m in week] == ["EPS-Sterna G", "Maintenance ", "Upd1: EPS St", "Optional tal"]
+    words = T.parse_exclude_words(T.DEFAULT_MEETING_EXCLUDE)
+    assert [T.meeting_preselected(m, words) for m in week] == [True, False, True, False]   # excluded, tentative
+    assert T.clean_meeting_subject("Upd1: EPS Sterna CCB") == "EPS Sterna CCB"
+    assert T.clean_meeting_subject("RE: FW:  Review") == "Review"
+    assert [T.meeting_effort(m) for m in week] == [0.125, 0.5, 0.1875, 0.125]   # hours / 8
+    task = T.meeting_task([(1, "T1", "WP6"), (22, "Participation in any necessary meeting", "WP6")])
+    entries = T.meeting_entries([week[0], week[2]], "Alice A", task)
+    assert [(e["date"], e["task_no"], e["effort"], e["description"]) for e in entries] == [
+        ("2026-11-10", 22, 0.125, "EPS-Sterna Ground Segment Engineering Team Weekly Meeting"),
+        ("2026-11-12", 22, 0.1875, "EPS Sterna CCB")]

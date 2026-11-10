@@ -2876,6 +2876,180 @@ def export_to_xlsx(data: list, out_path: str) -> None:
 # Import helpers
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# Meetings from the Outlook calendar: one entry per meeting, effort = hours / 8
+# ---------------------------------------------------------------------------
+
+HOURS_PER_PD = 8
+# Outlook "Show time as" (BusyStatus)
+BUSY_STATES = {0: "Free", 1: "Tentative", 2: "Busy", 3: "Out of office", 4: "Working elsewhere"}
+DEFAULT_MEETING_EXCLUDE = "Maintenance, Downtime, Placeholder, Weekend Weather, Cooking, Lunchtime"
+_SUBJECT_PREFIX = re.compile(r"^\s*(?:(?:upd(?:ated)?\s*\d*|re|fw|fwd|aw|wg|canceled|cancelled|copy)\s*:\s*)+",
+                             re.IGNORECASE)
+
+
+def meeting_settings_file() -> Path:
+    """Per-user choices of the meeting import (next to app_state.json)."""
+    return APP_STATE_FILE.with_name("meeting_import.json")
+
+
+def load_meeting_settings() -> dict:
+    try:
+        return json.loads(meeting_settings_file().read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+
+
+def save_meeting_settings(settings: dict) -> None:
+    try:
+        meeting_settings_file().write_text(json.dumps(settings, indent=2, ensure_ascii=False), encoding="utf-8")
+    except OSError as exc:
+        log.warning("save_meeting_settings: %s", exc)
+
+
+def clean_meeting_subject(subject: str) -> str:
+    """"Upd1: EPS Sterna CCB" -> "EPS Sterna CCB" (also RE:, FW:, Canceled:)."""
+    return " ".join(_SUBJECT_PREFIX.sub("", str(subject or "")).split())
+
+
+def meeting_hours(m: dict) -> float:
+    return max(0.0, (m["end"] - m["start"]).total_seconds() / 3600)
+
+
+def meeting_effort(m: dict) -> float:
+    """Person-days of a meeting: its duration / 8 h."""
+    return round(meeting_hours(m) / HOURS_PER_PD, 4)
+
+
+def meeting_preselected(m: dict, exclude_words) -> bool:
+    """Ticked by default: a timed, busy meeting of some length, not cancelled
+    and without any of the excluded words in its subject."""
+    subject = m["subject"].casefold()
+    return (not m["all_day"] and m["busy"] == 2 and not m.get("cancelled")
+            and meeting_hours(m) > 0 and "holiday" not in m.get("categories", "").casefold()
+            and not any(w.casefold() in subject for w in exclude_words if w.strip()))
+
+
+def parse_exclude_words(text: str) -> list[str]:
+    return [w.strip() for w in str(text).split(",") if w.strip()]
+
+
+def read_outlook_csv(path, start: datetime, end: datetime) -> list[dict]:
+    """Meetings starting in [start, end) from a calendar exported by Outlook
+    (File > Open & Export > Import/Export > Export to a file > CSV)."""
+    import csv as _csv
+    raw = Path(path).read_bytes()
+    try:
+        text = raw.decode("utf-8-sig")
+    except UnicodeDecodeError:
+        text = raw.decode("cp1252", errors="replace")
+    rows = list(_csv.DictReader(io.StringIO(text)))
+    # day/month or month/day: the first value whose first or second number is > 12 says it
+    day_first = True
+    for r in rows:
+        for key in ("Start Date", "End Date"):
+            nums = re.findall(r"\d+", r.get(key) or "")
+            if len(nums) >= 2 and int(nums[0]) > 12:
+                day_first = True; break
+            if len(nums) >= 2 and int(nums[1]) > 12:
+                day_first = False; break
+        else:
+            continue
+        break
+    date_fmt = "%d/%m/%Y" if day_first else "%m/%d/%Y"
+
+    def when(d, t):
+        d = re.sub(r"[.-]", "/", (d or "").strip())
+        for tf in ("%H:%M:%S", "%H:%M", "%I:%M:%S %p", "%I:%M %p"):
+            try:
+                return datetime.strptime(f"{d} {(t or '00:00:00').strip()}", f"{date_fmt} {tf}")
+            except ValueError:
+                continue
+        raise ValueError(d)
+
+    out = []
+    for r in rows:
+        try:
+            m = {"start": when(r.get("Start Date"), r.get("Start Time")),
+                 "end": when(r.get("End Date") or r.get("Start Date"), r.get("End Time")),
+                 "subject": r.get("Subject", "") or "",
+                 "all_day": str(r.get("All day event", "")).strip().lower() == "true",
+                 "busy": int(r.get("Show time as") or 2),
+                 "categories": r.get("Categories", "") or ""}
+        except ValueError:
+            continue
+        if start <= m["start"] < end:
+            out.append(m)
+    return sorted(out, key=lambda m: m["start"])
+
+
+def outlook_available() -> bool:
+    """Classic Outlook can be read here (Windows, pywin32 in the build)."""
+    if sys.platform != "win32":
+        return False
+    import importlib.util
+    try:
+        return importlib.util.find_spec("win32com.client") is not None
+    except (ImportError, ValueError):
+        return False
+
+
+def read_outlook_meetings(start: datetime, end: datetime) -> list[dict]:
+    """Meetings starting in [start, end) from the default calendar of the classic
+    Outlook running on this PC (its own profile: the work account). Recurring
+    meetings are expanded. Only date, time, subject, busy state and categories
+    are read: no attendees or body, so Outlook shows no security prompt."""
+    import locale
+    import win32com.client
+    ns = win32com.client.Dispatch("Outlook.Application").GetNamespace("MAPI")
+    items = ns.GetDefaultFolder(9).Items          # 9 = olFolderCalendar
+    items.Sort("[Start]")
+    items.IncludeRecurrences = True               # one item per occurrence
+
+    def naive(t):
+        return datetime(t.year, t.month, t.day, t.hour, t.minute, t.second)
+
+    try:   # Restrict wants the dates in the Windows date format
+        locale.setlocale(locale.LC_TIME, "")
+        fmt = lambda d: d.strftime("%x %H:%M")
+        found = items.Restrict(f"[Start] >= '{fmt(start)}' AND [Start] < '{fmt(end)}'")
+    except Exception as exc:
+        log.warning("Outlook Restrict failed (%s): reading the calendar in order", exc)
+        found = items
+    out = []
+    item = found.GetFirst()
+    seen = 0
+    while item is not None and seen < 50000:
+        seen += 1
+        try:
+            s, e = naive(item.Start), naive(item.End)
+            if s >= end:
+                break
+            if s >= start:
+                out.append({"start": s, "end": e, "subject": item.Subject or "",
+                            "all_day": bool(item.AllDayEvent), "busy": int(item.BusyStatus),
+                            "categories": item.Categories or "",
+                            "cancelled": int(getattr(item, "MeetingStatus", 0) or 0) in (5, 7)})
+        except Exception as exc:   # an item that is not an appointment
+            log.warning("Outlook item skipped: %s", exc)
+        item = found.GetNext()
+    return out
+
+
+def meeting_task(tasks) -> tuple | None:
+    """The task for meetings: the first whose title speaks of meetings."""
+    return next(((n, t, wp) for n, t, wp in tasks if "meeting" in t.casefold()), None)
+
+
+def meeting_entries(meetings, user: str, task: tuple) -> list[dict]:
+    """Table entries for the meetings: one each, effort = hours / 8."""
+    n, title, wp = task
+    return [normalise_activity({"date": m["start"].date().isoformat(), "user": user, "entry_type": "Activity",
+                                "task_no": n, "task_title": title, "task_wp": wp,
+                                "effort": meeting_effort(m), "description": clean_meeting_subject(m["subject"])})
+            for m in meetings]
+
+
 def import_activity_table(path: str | Path) -> tuple[list, list[str]]:
     """Returns (valid entries, descriptions of rejected rows)."""
     path = Path(path)
@@ -3356,6 +3530,203 @@ class NextWeekEditor(_FittedToplevel):
 # ---------------------------------------------------------------------------
 # Monthly report parameters dialog
 # ---------------------------------------------------------------------------
+
+class MeetingImportDialog(_FittedToplevel):
+    """File → Import meetings from Outlook…: the meetings of a week, from the
+    classic Outlook of this PC or from a calendar exported as CSV. Ticked rows
+    become entries of the meeting task, effort = hours / 8."""
+
+    def __init__(self, parent, week: tuple[int, int], tasks: list[tuple], user: str,
+                 existing, on_add):
+        super().__init__(parent)
+        self.title("Import meetings from Outlook")
+        self.configure(bg=BG_PANEL)
+        self._week = week
+        self._tasks = tasks
+        self._user = user
+        self._existing = existing          # (year, cw) -> Counter of loaded_key already there
+        self._on_add = on_add
+        self._meetings: list[dict] = []
+        self._checked: list[bool] = []
+        self._settings = load_meeting_settings()
+        self._task_labels = {f"{(wp + ' - ') if wp else ''}{n} - {t}": (n, t, wp) for n, t, wp in tasks}
+
+        top = ttk.Frame(self, padding=(12, 10, 12, 4))
+        top.pack(fill="x")
+        nav = ttk.Frame(top)
+        nav.pack(fill="x")
+        ttk.Button(nav, text="◀", width=3, command=lambda: self._step(-1)).pack(side="left")
+        self._week_var = tk.StringVar()
+        ttk.Label(nav, textvariable=self._week_var, font=("Segoe UI", 10, "bold")).pack(side="left", padx=8)
+        ttk.Button(nav, text="▶", width=3, command=lambda: self._step(+1)).pack(side="left")
+
+        self._source = tk.StringVar(value="outlook" if outlook_available() and
+                                    self._settings.get("source", "outlook") == "outlook" else "csv")
+        src = ttk.Frame(top)
+        src.pack(fill="x", pady=(8, 0))
+        ttk.Label(src, text="From").pack(side="left", padx=(0, 6))
+        rb = ttk.Radiobutton(src, text="Outlook on this PC", value="outlook", variable=self._source,
+                             command=self._reload)
+        rb.pack(side="left")
+        if not outlook_available():
+            rb.state(["disabled"])
+        ttk.Radiobutton(src, text="CSV exported from Outlook:", value="csv", variable=self._source,
+                        command=self._reload).pack(side="left", padx=(14, 4))
+        self._csv_var = tk.StringVar(value=self._settings.get("csv", ""))
+        ttk.Entry(src, textvariable=self._csv_var, width=40).pack(side="left", fill="x", expand=True)
+        ttk.Button(src, text="…", width=3, command=self._choose_csv).pack(side="left", padx=(4, 0))
+
+        opts = ttk.Frame(top)
+        opts.pack(fill="x", pady=(8, 0))
+        opts.columnconfigure(1, weight=1)
+        ttk.Label(opts, text="Task").grid(row=0, column=0, sticky="w", padx=(0, 6))
+        default = meeting_task(tasks)
+        self._task_var = tk.StringVar(value=next((k for k, v in self._task_labels.items() if v == default), ""))
+        task_cb = ttk.Combobox(opts, textvariable=self._task_var, values=list(self._task_labels),
+                               state="readonly")
+        task_cb.grid(row=0, column=1, sticky="we")
+        task_cb.bind("<<ComboboxSelected>>", lambda e: self._fill())
+        ttk.Label(opts, text="Untick subjects with").grid(row=1, column=0, sticky="w", padx=(0, 6), pady=(4, 0))
+        self._exclude_var = tk.StringVar(value=self._settings.get("exclude", DEFAULT_MEETING_EXCLUDE))
+        ex = ttk.Entry(opts, textvariable=self._exclude_var)
+        ex.grid(row=1, column=1, sticky="we", pady=(4, 0))
+        ex.bind("<Return>", lambda e: self._apply_exclude())
+        ttk.Button(opts, text="Apply", command=self._apply_exclude).grid(row=1, column=2, padx=(6, 0), pady=(4, 0))
+
+        box = ttk.Frame(self, padding=(12, 6, 12, 0))
+        box.pack(fill="both", expand=True)
+        cols = (("use", "", 30), ("date", "Date", 90), ("time", "Time", 95), ("hours", "Hours", 55),
+                ("pd", "PD", 60), ("status", "Status", 110), ("subject", "Subject (description)", 420))
+        self._tree = ttk.Treeview(box, columns=[c[0] for c in cols], show="headings", height=14)
+        for key, head, width in cols:
+            self._tree.heading(key, text=head)
+            self._tree.column(key, width=width, anchor="w" if key in ("subject", "status") else "center",
+                              stretch=key == "subject")
+        self._tree.tag_configure("off", foreground=FG_DIM)
+        scroll = ttk.Scrollbar(box, orient=tk.VERTICAL, command=self._tree.yview)
+        self._tree.configure(yscrollcommand=scroll.set)
+        scroll.pack(side="right", fill="y")
+        self._tree.pack(fill="both", expand=True)
+        self._tree.bind("<ButtonRelease-1>", self._toggle)
+        self._tree.bind("<space>", self._toggle)
+
+        bottom = ttk.Frame(self, padding=(12, 8, 12, 12))
+        bottom.pack(fill="x")
+        self._info_var = tk.StringVar()
+        ttk.Label(bottom, textvariable=self._info_var).pack(side="left")
+        ttk.Button(bottom, text="Cancel", command=self.destroy).pack(side="right")
+        self._btn_add = ttk.Button(bottom, text="Add to table", style="Accent.TButton", command=self._add)
+        self._btn_add.pack(side="right", padx=(0, 8))
+        ttk.Button(bottom, text="None", command=lambda: self._set_all(False)).pack(side="right", padx=(0, 16))
+        ttk.Button(bottom, text="All", command=lambda: self._set_all(True)).pack(side="right", padx=(0, 4))
+
+        self._fit_window(980, 600)
+        self.grab_set()
+        self.after(50, self._reload)
+
+    # -- data ----------------------------------------------------------------
+    def _range(self):
+        mon = iso_week_monday(*self._week)
+        return datetime.combine(mon, datetime.min.time()), datetime.combine(mon + timedelta(days=7),
+                                                                            datetime.min.time())
+
+    def _step(self, delta):
+        y, cw = self._week
+        mon = iso_week_monday(y, cw) + timedelta(weeks=delta)
+        self._week = iso_year_week_for_date(mon)
+        self._reload()
+
+    def _choose_csv(self):
+        path = filedialog.askopenfilename(parent=self, title="Calendar exported from Outlook (CSV)",
+                                          filetypes=[("CSV", "*.csv"), ("All files", "*.*")])
+        if path:
+            self._csv_var.set(path)
+            self._source.set("csv")
+            self._reload()
+
+    def _reload(self):
+        y, cw = self._week
+        mon = iso_week_monday(y, cw)
+        self._week_var.set(f"CW{cw:02d}/{y}   {mon:%d %b} → {mon + timedelta(days=6):%d %b %Y}")
+        start, end = self._range()
+        self._meetings = []
+        try:
+            if self._source.get() == "outlook":
+                self.config(cursor="watch"); self.update()
+                self._meetings = read_outlook_meetings(start, end)
+            elif self._csv_var.get().strip():
+                self._meetings = read_outlook_csv(self._csv_var.get().strip(), start, end)
+        except Exception as exc:
+            log.error("meeting import: %s", exc)
+            messagebox.showerror("Meetings", f"The meetings could not be read:\n{exc}", parent=self)
+        finally:
+            self.config(cursor="")
+        self._apply_exclude(fill=True)
+
+    def _task(self):
+        return self._task_labels.get(self._task_var.get())
+
+    def _already(self):
+        """Meetings already in the table or the archive (same entry): not ticked."""
+        task = self._task()
+        if not task:
+            return [False] * len(self._meetings)
+        left = Counter(self._existing(self._week))
+        out = []
+        for e in meeting_entries(self._meetings, self._user, task):
+            k = loaded_key(e)
+            out.append(left[k] > 0)
+            if left[k] > 0:
+                left[k] -= 1
+        return out
+
+    def _apply_exclude(self, fill=True):
+        words = parse_exclude_words(self._exclude_var.get())
+        already = self._already()
+        self._checked = [meeting_preselected(m, words) and not a for m, a in zip(self._meetings, already)]
+        self._fill(already)
+
+    def _fill(self, already=None):
+        already = already if already is not None else self._already()
+        self._tree.delete(*self._tree.get_children())
+        for k, (m, on) in enumerate(zip(self._meetings, self._checked)):
+            status = "already in" if already[k] else ("cancelled" if m.get("cancelled") else
+                     "all day" if m["all_day"] else BUSY_STATES.get(m["busy"], str(m["busy"])))
+            self._tree.insert("", "end", iid=str(k), tags=() if on else ("off",), values=(
+                "☑" if on else "☐", m["start"].strftime("%a %d/%m"),
+                "" if m["all_day"] else f"{m['start']:%H:%M}–{m['end']:%H:%M}",
+                f"{meeting_hours(m):g}", format_effort(meeting_effort(m)), status,
+                clean_meeting_subject(m["subject"])))
+        n = sum(self._checked)
+        pd = sum(meeting_effort(m) for m, on in zip(self._meetings, self._checked) if on)
+        source = "Outlook" if self._source.get() == "outlook" else "CSV"
+        self._info_var.set(f"{len(self._meetings)} meetings in {source}  ·  {n} ticked  ·  "
+                           f"{format_effort(pd)} PD ({pd * HOURS_PER_PD:g} h)")
+        self._btn_add.state(["!disabled"] if n and self._task() else ["disabled"])
+
+    def _toggle(self, event=None):
+        iid = self._tree.focus() if event is None or event.type != tk.EventType.ButtonRelease \
+            else self._tree.identify_row(event.y)
+        if not iid:
+            return
+        self._checked[int(iid)] = not self._checked[int(iid)]
+        self._fill()
+        self._tree.focus(iid); self._tree.selection_set(iid)
+
+    def _set_all(self, value: bool):
+        self._checked = [value] * len(self._meetings)
+        self._fill()
+
+    def _add(self):
+        chosen = [m for m, on in zip(self._meetings, self._checked) if on]
+        task = self._task()
+        if not chosen or not task:
+            return
+        save_meeting_settings({"source": self._source.get(), "csv": self._csv_var.get().strip(),
+                               "exclude": self._exclude_var.get()})
+        self._on_add(meeting_entries(chosen, self._user, task))
+        self.destroy()
+
 
 class ReportParamsDialog(_FittedToplevel):
     """Edit config/report_params.txt: cover-page values of the monthly report."""
@@ -4289,6 +4660,7 @@ class App:
         m_file.add_command(label="Export table (CSV/JSON)…", command=self.export_table)
         m_file.add_command(label="Export table to Excel…",   command=self.export_xlsx)
         m_file.add_command(label="Import entries from another user (CSV/JSON)…", command=self.import_table)
+        m_file.add_command(label="Import meetings from Outlook…", command=self.import_meetings)
         m_file.add_separator()
         m_file.add_command(label="Reset…",                   command=self.reset_data)
         m_file.add_command(label="Exit",                     command=self.on_close)
@@ -6055,6 +6427,34 @@ class App:
         except Exception as e:
             log.error("export_xlsx: %s", e)
             messagebox.showerror("Export error", str(e))
+
+    def import_meetings(self) -> None:
+        """Meetings of the week chosen in the bottom bar, from Outlook or a CSV
+        export, added to the table as entries of the meeting task."""
+        if not require_io_dir() or not self._writable() or not self._end_edit("Import meetings"):
+            return
+        try:
+            week = (int(self.week_year.get()), int(self.cw_var.get()))
+            iso_week_monday(*week)
+        except Exception:
+            week = iso_year_week_for_date(date.today())
+
+        def existing(wk):
+            keys = Counter(loaded_key(a) for a in self.data)
+            keys.update(loaded_key(a) for a in load_week_entries(*wk)
+                        if not _is_loaded(a, self._loaded_week_keys))
+            return keys
+
+        def add(entries):
+            self._push_undo("import meetings")
+            self.data.extend(entries)
+            self._persist()
+            self._set_table_dirty()
+            self.refresh()
+            pd = sum(e["effort"] for e in entries)
+            self._status(f"{len(entries)} meetings added ({format_effort(pd)} PD) — Save week to archive them.")
+
+        MeetingImportDialog(self.root, week, self.tasks, self.user_var.get(), existing, add)
 
     def import_table(self) -> None:
         if not require_io_dir() or not self._writable() or not self._end_edit("Import"):
