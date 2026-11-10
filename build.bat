@@ -71,7 +71,7 @@ python -m PyInstaller --version >nul 2>&1
 if errorlevel 1 ( python -m pip install pyinstaller )
 :: python -m pip: the same Python that runs PyInstaller (a plain "pip" may be another one)
 python -m pip install python-docx lxml openpyxl pywin32 --quiet >> %LOG_FILE% 2>&1
-python -c "import win32com.client.dynamic" >nul 2>&1
+python -c "import win32com.client.dynamic, win32timezone" >nul 2>&1
 if errorlevel 1 ( echo [ERROR] pywin32 is not installed for this Python: the exe could not read Outlook. & pause & exit /b 1 )
 echo  [OK] Dependencies ready.
 
@@ -99,7 +99,7 @@ echo  [INFO] Building exe...
 set ATTEMPT=0
 :build_exe
 set /a ATTEMPT+=1
-python -m PyInstaller --onefile --windowed --name "%APP_NAME%" --icon "assets\exostaff_icon.ico" --add-data "assets;assets" --add-data "build_info.json;." --hidden-import win32com.client.dynamic --hidden-import pythoncom --hidden-import pywintypes --distpath "%DIST_DIR%" --workpath "%BUILD_DIR%" --clean %SCRIPT% > "%BUILD_ROOT%\pyinstaller_last.log" 2>&1
+python -m PyInstaller --onefile --windowed --name "%APP_NAME%" --icon "assets\exostaff_icon.ico" --add-data "assets;assets" --add-data "build_info.json;." --hidden-import win32com.client.dynamic --hidden-import pythoncom --hidden-import pywintypes --hidden-import win32timezone --distpath "%DIST_DIR%" --workpath "%BUILD_DIR%" --clean %SCRIPT% > "%BUILD_ROOT%\pyinstaller_last.log" 2>&1
 set BUILD_ERR=%errorlevel%
 type "%BUILD_ROOT%\pyinstaller_last.log" >> %LOG_FILE%
 if "%BUILD_ERR%"=="0" goto build_ok
