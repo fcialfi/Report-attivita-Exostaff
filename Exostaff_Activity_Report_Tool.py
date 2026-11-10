@@ -20,6 +20,7 @@ Changes vs v3:
 """
 
 import io
+import importlib
 import json
 import re
 import math
@@ -3035,6 +3036,7 @@ def outlook_available() -> bool:
         return False
     try:
         import win32com.client.dynamic
+        importlib.import_module("win32timezone")   # needed for the meeting times
         outlook_problem = "" if hasattr(win32com.client.dynamic, "Dispatch") else "pywin32 incomplete"
     except Exception as exc:   # ImportError, or a DLL of pywin32 missing in the exe
         outlook_problem = f"pywin32 not in this build ({type(exc).__name__}: {exc})"
@@ -3049,6 +3051,7 @@ def read_outlook_meetings(start: datetime, end: datetime) -> list[dict]:
     are read: no attendees or body, so Outlook shows no security prompt."""
     import locale
     import win32com.client.dynamic
+    importlib.import_module("win32timezone")   # pywin32 needs it for the meeting times (hidden import in build.bat)
     # dynamic dispatch: no makepy cache to write (it cannot be written inside the exe)
     ns = win32com.client.dynamic.Dispatch("Outlook.Application").GetNamespace("MAPI")
     items = ns.GetDefaultFolder(9).Items          # 9 = olFolderCalendar
@@ -3630,7 +3633,9 @@ class MeetingImportDialog(_FittedToplevel):
         rb.pack(side="left")
         if not outlook_available():
             rb.state(["disabled"])
-            add_tooltip(rb, f"Outlook link not available: {outlook_problem}")
+            # the reason in plain sight (a tooltip does not show on a disabled option)
+            ttk.Label(top, text=f"Outlook link not available: {outlook_problem}", foreground="#e07b00",
+                      wraplength=900, justify="left").pack(fill="x", pady=(4, 0))
         ttk.Radiobutton(src, text="CSV exported from Outlook:", value="csv", variable=self._source,
                         command=self._reload).pack(side="left", padx=(14, 4))
         self._csv_var = tk.StringVar(value=self._settings.get("csv", ""))
