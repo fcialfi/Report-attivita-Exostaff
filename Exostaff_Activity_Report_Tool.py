@@ -3021,15 +3021,25 @@ def read_outlook_csv(path, start: datetime, end: datetime) -> list[dict]:
     return sorted(out, key=lambda m: m["start"])
 
 
+# Why the Outlook link is not available ("" when it is), shown in the import window
+outlook_problem = ""
+
+
 def outlook_available() -> bool:
-    """Classic Outlook can be read here (Windows, pywin32 in the build)."""
+    """Classic Outlook can be read here (Windows, pywin32 in the build). The
+    module is really imported: in the exe a missing part of pywin32 shows up
+    only then."""
+    global outlook_problem
     if sys.platform != "win32":
+        outlook_problem = "only on Windows"
         return False
-    import importlib.util
     try:
-        return importlib.util.find_spec("win32com.client") is not None
-    except (ImportError, ValueError):
-        return False
+        import win32com.client.dynamic
+        outlook_problem = "" if hasattr(win32com.client.dynamic, "Dispatch") else "pywin32 incomplete"
+    except Exception as exc:   # ImportError, or a DLL of pywin32 missing in the exe
+        outlook_problem = f"pywin32 not in this build ({type(exc).__name__}: {exc})"
+        log.warning("Outlook link not available: %s", outlook_problem)
+    return not outlook_problem
 
 
 def read_outlook_meetings(start: datetime, end: datetime) -> list[dict]:
@@ -3038,8 +3048,9 @@ def read_outlook_meetings(start: datetime, end: datetime) -> list[dict]:
     meetings are expanded. Only date, time, subject, busy state and categories
     are read: no attendees or body, so Outlook shows no security prompt."""
     import locale
-    import win32com.client
-    ns = win32com.client.Dispatch("Outlook.Application").GetNamespace("MAPI")
+    import win32com.client.dynamic
+    # dynamic dispatch: no makepy cache to write (it cannot be written inside the exe)
+    ns = win32com.client.dynamic.Dispatch("Outlook.Application").GetNamespace("MAPI")
     items = ns.GetDefaultFolder(9).Items          # 9 = olFolderCalendar
     items.Sort("[Start]")
     items.IncludeRecurrences = True               # one item per occurrence
@@ -3619,6 +3630,7 @@ class MeetingImportDialog(_FittedToplevel):
         rb.pack(side="left")
         if not outlook_available():
             rb.state(["disabled"])
+            add_tooltip(rb, f"Outlook link not available: {outlook_problem}")
         ttk.Radiobutton(src, text="CSV exported from Outlook:", value="csv", variable=self._source,
                         command=self._reload).pack(side="left", padx=(14, 4))
         self._csv_var = tk.StringVar(value=self._settings.get("csv", ""))
