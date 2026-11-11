@@ -3105,6 +3105,19 @@ def read_outlook_meetings(start: datetime, end: datetime) -> list[dict]:
     return out
 
 
+NEW_OUTLOOK_TEXT = ("Outlook on this PC cannot be read: this is probably the new Outlook, which does not "
+                    "let other programs read the calendar.\n\nSwitch \"New Outlook\" off (top right in "
+                    "Outlook) to use classic Outlook, or use a CSV exported from classic Outlook.")
+
+
+def meeting_error_text(exc: Exception, source: str) -> str:
+    """Message for a failed meeting import. Reading Outlook fails at
+    Outlook.Application / GetNamespace when the PC has the new Outlook (no COM)."""
+    if source == "outlook":
+        return f"{NEW_OUTLOOK_TEXT}\n\n(Details: {exc})"
+    return f"The meetings could not be read:\n{exc}"
+
+
 def meeting_task(tasks, user: str = "", saved: dict | None = None) -> tuple | None:
     """The task proposed for a user's meetings: the last one they used (saved:
     {user: [task_no, wp]}); else the meeting task of their WP; else task 1 (the
@@ -3742,7 +3755,7 @@ class MeetingImportDialog(_FittedToplevel):
                 self._meetings = read_outlook_csv(self._csv_var.get().strip(), start, end)
         except Exception as exc:
             log.error("meeting import: %s", exc)
-            messagebox.showerror("Meetings", f"The meetings could not be read:\n{exc}", parent=self)
+            messagebox.showerror("Meetings", meeting_error_text(exc, self._source.get()), parent=self)
         finally:
             self.config(cursor="")
         self._apply_exclude(fill=True)
