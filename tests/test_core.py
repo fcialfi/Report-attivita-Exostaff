@@ -407,3 +407,10 @@ def test_meetings_from_an_outlook_csv(tool, tmp_path):
     assert [(e["date"], e["task_no"], e["effort"], e["description"]) for e in entries] == [
         ("2026-11-10", 22, 0.2, "EPS-Sterna Ground Segment Engineering Team Weekly Meeting"),
         ("2026-11-12", 22, 0.2, "EPS Sterna CCB")]
+
+
+def test_meeting_error_points_to_the_new_outlook(tool):
+    T = tool
+    text = T.meeting_error_text(Exception("Outlook.Application.GetNamespace"), "outlook")
+    assert "new Outlook" in text and "New Outlook" in text and "GetNamespace" in text
+    assert T.meeting_error_text(ValueError("bad date"), "csv") == "The meetings could not be read:\nbad date"
