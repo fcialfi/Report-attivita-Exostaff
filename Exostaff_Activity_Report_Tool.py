@@ -442,12 +442,50 @@ HOLIDAYS_TEMPLATE = """# EUMETSAT Public Holidays
 """
 
 
+# ---------------------------------------------------------------------------
+# OneDrive: a shared file "online only" that OneDrive cannot download on this
+# PC (paused, not running, low resources) fails with errno 22 / a cloud-file
+# Windows error. Noted here and shown once to the user with what to do.
+# ---------------------------------------------------------------------------
+
+ONEDRIVE_HELP = ("OneDrive could not provide these shared files on this PC (they are \"online only\" and "
+                 "could not be downloaded):\n\n{files}\n\nWhat to do:\n"
+                 "1. Restart OneDrive: cloud icon at the bottom right → Settings → Quit OneDrive, then "
+                 "start OneDrive again from the Start menu.\n"
+                 "2. Check that there is free space on C:.\n"
+                 "3. Right-click the working folder → \"Always keep on this device\".\n"
+                 "Then close and reopen the tool.")
+cloud_errors: list[str] = []   # names of the shared files OneDrive could not provide
+
+
+def is_cloud_error(exc: BaseException) -> bool:
+    if not isinstance(exc, OSError):
+        return False
+    winerror = getattr(exc, "winerror", None)
+    return exc.errno == 22 or (winerror is not None and 358 <= winerror <= 410)
+
+
+def note_cloud_error(path, exc: BaseException) -> bool:
+    """Record a OneDrive failure on a shared file; True if it was one."""
+    if not is_cloud_error(exc):
+        return False
+    name = Path(path).name
+    if name not in cloud_errors:
+        cloud_errors.append(name)
+    log.warning("OneDrive could not provide %s: %s", path, exc)
+    return True
+
+
 def read_config_text(path: Path) -> str:
     """Read a hand-edited config file: UTF-8 with or without BOM (Notepad),
     falling back to Windows ANSI. A BOM would otherwise turn the first
     comment line into a user, and ANSI accents (e.g. "Nicolò") crashed
     the tool at startup."""
-    data = path.read_bytes()
+    try:
+        data = path.read_bytes()
+    except OSError as exc:
+        note_cloud_error(path, exc)
+        raise
     try:
         return data.decode("utf-8-sig")
     except UnicodeDecodeError:
@@ -858,6 +896,7 @@ def _read_lock(attempts: int = 5) -> dict | None:
         except Exception as exc:
             if attempt == attempts - 1:
                 log.warning("lock file unreadable: %s", exc)
+                note_cloud_error(lock_file(), exc)
                 return {}
             time.sleep(0.3)
     return {}
@@ -958,6 +997,9 @@ def read_lock_info() -> str:
     if info is None:
         return "nobody any more (the lock is gone: start the tool again)"
     if not info:
+        if lock_file().name in cloud_errors:
+            return ("a lock file that OneDrive cannot download on this PC — restart OneDrive (see the "
+                    "user guide) or click Force Unlock to replace it")
         try:
             changed = datetime.fromtimestamp(lock_file().stat().st_mtime).strftime(_TS_FMT)
         except OSError:
@@ -1452,6 +1494,7 @@ def load_week_entries(year: int, cw: int) -> list:
         return normalise_data(json.loads(wf.read_text(encoding="utf-8")))
     except Exception as exc:
         log.warning("load_week_entries %s: %s", wf, exc)
+        note_cloud_error(wf, exc)
         skipped_archives.append(wf.name)
         return []
 
@@ -1590,13 +1633,22 @@ data_load_warning: str | None = None
 
 
 def read_json() -> tuple[list, bool, Path | None]:
-    global data_load_warning
+    global data_load_warning, read_only
     data_load_warning = None
     if data_file().exists():
         try:
             data = normalise_data(json.loads(data_file().read_text(encoding="utf-8")))
         except Exception as exc:
             log.error("read_json failed: %s", exc)
+            if note_cloud_error(data_file(), exc):
+                # Not a damaged file: OneDrive did not give it. Read-only, or the
+                # first change would overwrite the real table with an empty one.
+                read_only = True
+                data_load_warning = (
+                    f"The table ({data_file().name}) could not be read: OneDrive did not provide it.\n\n"
+                    "The tool is READ-ONLY until it is reopened, so that the real table is not "
+                    "overwritten with an empty one.")
+                return [], False, None
             # Keep a copy before the next save overwrites the damaged file
             dest = backups_dir() / f"corrupt_{datetime.now():%Y%m%d_%H%M%S}_{data_file().name}"
             try:
@@ -4718,6 +4770,7 @@ class App:
 
         if data_load_warning:
             messagebox.showwarning("Data file problem", data_load_warning)
+            self._warn_cloud_errors()
 
         # Show warning if saved working folder was not found
         if getattr(self, "_pending_folder_warning", None):
@@ -5158,6 +5211,13 @@ class App:
         self._hide_suggestions()
         self.desc.focus_set()
 
+    def _warn_cloud_errors(self) -> None:
+        """Once per session: the shared files OneDrive could not provide, and what to do."""
+        if cloud_errors and not getattr(self, "_cloud_warned", False):
+            self._cloud_warned = True
+            messagebox.showwarning("OneDrive problem", ONEDRIVE_HELP.format(
+                files="\n".join(f"• {name}" for name in cloud_errors)))
+
     def _status(self, msg: str) -> None:
         self._status_var.set(msg)
         self.root.after(6000, lambda: self._status_var.set(""))
@@ -5576,6 +5636,8 @@ class App:
         self.refresh()
 
     def refresh(self) -> None:
+        if cloud_errors and not getattr(self, "_cloud_warned", False):
+            self.root.after_idle(self._warn_cloud_errors)
         self.data    = normalise_data(self.data)
         filt         = self._filter_var.get().lower() if hasattr(self, "_filter_var") else ""
 
@@ -6464,6 +6526,7 @@ class App:
         self.data, was_reset, saved_file = read_json()
         if data_load_warning:
             messagebox.showwarning("Data file problem", data_load_warning)
+            self._warn_cloud_errors()
         self._loaded_week_keys = startup_loaded_keys(self.data)
         self._table_dirty_after_load()
         if self.data:

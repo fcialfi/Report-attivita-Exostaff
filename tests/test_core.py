@@ -414,3 +414,26 @@ def test_meeting_error_points_to_the_new_outlook(tool):
     text = T.meeting_error_text(Exception("Outlook.Application.GetNamespace"), "outlook")
     assert "new Outlook" in text and "New Outlook" in text and "GetNamespace" in text
     assert T.meeting_error_text(ValueError("bad date"), "csv") == "The meetings could not be read:\nbad date"
+
+
+def test_onedrive_failures_are_recognised(tool, monkeypatch):
+    T = tool
+    monkeypatch.setattr(T, "cloud_errors", [])
+    err = OSError(22, "Invalid argument")
+    assert T.is_cloud_error(err) and not T.is_cloud_error(OSError(2, "No such file"))
+    real = type(T.data_file()).read_text
+
+    def offline(self, *a, **k):
+        if self.name in ("activities_current.json", "activity_report.lock"):
+            raise OSError(22, "Invalid argument")
+        return real(self, *a, **k)
+    T.data_file().write_text("[]", encoding="utf-8")
+    T.lock_file().write_text("{}", encoding="utf-8")
+    monkeypatch.setattr(type(T.data_file()), "read_text", offline)
+    monkeypatch.setattr(T.time, "sleep", lambda s: None)
+    monkeypatch.setattr(T, "read_only", False)
+    data, _, _ = T.read_json()
+    assert data == [] and T.read_only                      # the real table must not be overwritten
+    assert "OneDrive" in T.data_load_warning
+    assert "OneDrive cannot download" in T.read_lock_info()
+    assert T.cloud_errors == ["activities_current.json", "activity_report.lock"]
