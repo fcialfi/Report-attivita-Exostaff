@@ -310,3 +310,13 @@ def test_user_sets_their_wp_and_meeting_task(session, tool, monkeypatch, tmp_pat
     assert tool.meeting_task(a.tasks, "Alice A")[:3:2] == (16, "WP6")
     assert tool.meeting_task(a.tasks, "Bob B")[:3:2] == (1, "WP7")
     assert tool.meeting_task(a.tasks, "Bob B", {"Bob B": [2, "WP7"]})[:3:2] == (2, "WP7")
+
+
+def test_onedrive_warning_shown_once(session, tool, monkeypatch):
+    monkeypatch.setattr(tool, "cloud_errors", [])
+    s = session(date(2026, 11, 11))
+    tool.cloud_errors.append("week_2026_CW46.json")
+    s.app.refresh(); s.root.update()
+    s.app.refresh(); s.root.update()
+    shown = [d for d in tool.dialogs if d[1] == "OneDrive problem"]
+    assert len(shown) == 1 and "week_2026_CW46.json" in shown[0][2]
