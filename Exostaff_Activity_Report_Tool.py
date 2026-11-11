@@ -846,14 +846,21 @@ def _pid_is_running(pid: int) -> bool:
         return False
 
 
-def _read_lock() -> dict | None:
-    try:
-        return json.loads(lock_file().read_text(encoding="utf-8"))
-    except FileNotFoundError:
-        return None
-    except Exception as exc:
-        log.warning("lock file unreadable: %s", exc)
-        return {}
+def _read_lock(attempts: int = 5) -> dict | None:
+    """The lock (None: no lock; {}: a lock file that cannot be read). OneDrive
+    holds the file for a moment while it syncs it, or it is half downloaded:
+    a few attempts before giving up."""
+    for attempt in range(attempts):
+        try:
+            return json.loads(lock_file().read_text(encoding="utf-8"))
+        except FileNotFoundError:
+            return None
+        except Exception as exc:
+            if attempt == attempts - 1:
+                log.warning("lock file unreadable: %s", exc)
+                return {}
+            time.sleep(0.3)
+    return {}
 
 
 def _lock_is_ours(info: dict | None) -> bool:
@@ -923,9 +930,12 @@ def acquire_lock() -> bool:
     except Exception as exc:
         log.warning("acquire_lock write failed: %s", exc)
         return True   # on error, let the user through
-    # Two PCs starting together both write: the last writer wins, so check
+    # Two PCs starting together both write: the last writer wins, so check.
+    # A lock we just wrote and cannot read back (OneDrive syncing it) is ours:
+    # without this the user was locked out by their own lock ("another user").
     time.sleep(1.0)
-    return _lock_is_ours(_read_lock()) or _read_lock() is None
+    info = _read_lock()
+    return info is None or not info or _lock_is_ours(info)
 
 
 def refresh_lock() -> bool:
@@ -945,8 +955,15 @@ def refresh_lock() -> bool:
 
 def read_lock_info() -> str:
     info = _read_lock()
+    if info is None:
+        return "nobody any more (the lock is gone: start the tool again)"
     if not info:
-        return "another user"
+        try:
+            changed = datetime.fromtimestamp(lock_file().stat().st_mtime).strftime(_TS_FMT)
+        except OSError:
+            changed = "?"
+        return (f"an unreadable lock file (last changed {changed}) — probably still syncing "
+                "with OneDrive: wait a few seconds and start the tool again")
     return (f"{info.get('user', '?')} on {info.get('host', '?')} "
             f"(since {info.get('since', '?')}, last seen {info.get('heartbeat', '?')})")
 
@@ -3400,13 +3417,14 @@ def show_lock_error(root: tk.Tk, owner: str) -> None:
     dialog.title("Application already in use")
     dialog.resizable(False, False)
     dialog.attributes("-topmost", True)
-    w, h = 500, 250
+    w, h = 520, 290
     sw, sh = root.winfo_screenwidth(), root.winfo_screenheight()
     dialog.geometry(f"{w}x{h}+{(sw-w)//2}+{(sh-h)//2}")
     tk.Label(dialog, text="⚠", font=("Segoe UI", 28), fg="#e65100").pack(pady=(18, 0))
     tk.Label(dialog, text="Activity Report Tool is currently in use by:",
              font=("Segoe UI", 9)).pack()
-    tk.Label(dialog, text=owner, font=("Segoe UI", 9, "bold"), fg="#c62828").pack(pady=(2, 8))
+    tk.Label(dialog, text=owner, font=("Segoe UI", 9, "bold"), fg="#c62828",
+             wraplength=460, justify="center").pack(pady=(2, 8))
     tk.Label(
         dialog,
         text="Please wait until they close the application.\n"

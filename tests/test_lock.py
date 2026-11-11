@@ -45,3 +45,28 @@ def test_stale_lock_from_another_pc_is_taken(tool, two_pcs):
     info["heartbeat_epoch"] -= tool.LOCK_STALE_SECONDS + 60
     tool.lock_file().write_text(json.dumps(info))
     two_pcs("pcB", 2); assert tool.acquire_lock()
+
+
+def test_own_lock_unreadable_while_onedrive_syncs_it(tool, two_pcs, monkeypatch):
+    """OneDrive holds the lock just written: the user must not be locked out by their own lock."""
+    two_pcs("pcA", 1)
+    real = type(tool.lock_file()).read_text
+    calls = {"n": 0}
+
+    def busy(self, *a, **k):
+        if self.name == tool.lock_file().name:
+            calls["n"] += 1
+            raise PermissionError("in use by OneDrive")
+        return real(self, *a, **k)
+    monkeypatch.setattr(type(tool.lock_file()), "read_text", busy)
+    assert tool.acquire_lock()                # no lock, write, read back fails: ours
+    assert calls["n"] >= 5                    # it tried several times first
+
+
+def test_lock_message_says_why(tool, two_pcs):
+    two_pcs("pcA", 1); tool.acquire_lock()
+    assert "pcA" in tool.read_lock_info()
+    tool.lock_file().write_text("")
+    assert "unreadable lock file" in tool.read_lock_info() and "OneDrive" in tool.read_lock_info()
+    tool.lock_file().unlink()
+    assert "nobody" in tool.read_lock_info()
